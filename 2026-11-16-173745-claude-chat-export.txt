@@ -1,0 +1,3455 @@
+ ▐▛███▛█   Claude Code v2.1.309
+▝▜██████▀  Opus 5.5 · Claude Pro
+ ▝▝   ▝▝   C:\Code\edgar-api
+
+
+❯ We're buliding an api to access company information and their filings. The    
+  goal of the API is the following:                                             
+  Look up a company by ticker                                                   
+  ● List a company's filings, newest first, filtered by form type (for example  
+  10-K or 8-K)                                                                  
+  and date range, with pagination. Each filing should include the form type,    
+  filing date,                                                                  
+  report date, accession number and a link to the primary document on sec.gov   
+  ● Fetch a single filing by its accession number                               
+  To achieve this I have a suggestion that we implement the following           
+  endpoints:                                                                    
+  GET api/company/{ticker}                                                      
+  GET api/company/{ticker}/filings?form-type={formtype}&start-date={startdate}& 
+  end-date={enddate}&cursor={pagecursor}                                        
+  GET api/company/{ticker}/filing/{accessionnumber}                             
+                                                                                
+  Help me figure out if I have forgotten anything in terms of what is needed to 
+  fulfill the API requirements.                                                 
+
+● Your three endpoints cover all three requirements. A few gaps would still
+  cause trouble once you build it. The most important ones come first.
+
+  1. Single filing lookup: route scope vs data source
+
+  The requirement says "fetch a single filing by its accession number", with no
+  company in it. Your route needs the ticker too, so a caller holding only an
+  accession number can't use it.
+
+  The catch is that EDGAR can't look a filing up by accession number alone:
+  - The 10-digit prefix of an accession number is the filer's ID, which is often
+    a filing agent rather than the company's CIK.
+  - The archive path is sec.gov/Archives/edgar/data/{cik}/{accessionNoDashes}/,
+    which needs the CIK.
+
+  You have two options:
+  - Keep the nested route. Ticker gives CIK, then you find the filing. This is
+    cheap. Return 404 if the filing doesn't belong to that company.
+  - Add GET api/filings/{accessionNumber}. This needs your own index (DB)
+    mapping accession numbers to CIKs.
+
+  Pick one on purpose and write down why.
+
+  2. Pagination contract is missing
+
+  - Add a limit (page size) parameter, with a default and a maximum.
+  - Define the response envelope, e.g. { data: [...], nextCursor: string | null 
+    }.
+  - Make the sort stable: filingDate desc, then accessionNumber desc to break
+    ties. Without the tie-breaker, the cursor can skip or repeat rows.
+  - Tie the cursor to its filters. Either encode the filters inside the cursor,
+    or reject a cursor sent with different filters.
+
+  3. Filter semantics are undefined
+
+  - Which date does the range apply to? Filing date or report date? The
+    requirement doesn't say, so choose one (filing date is the likely one) and
+    document it.
+  - Are the bounds inclusive? Use ISO YYYY-MM-DD. Return 400 when start > end.
+  - Form type:
+    - Can callers pass more than one? 10-K,10-Q or a repeated param.
+    - What about amendments? Does 10-K also match 10-K/A? Decide.
+    - Matching should be case-insensitive.
+
+  4. Response shapes are undefined
+
+  Company: at minimum cik, ticker, name. Optional: exchange, sic.
+
+  Filing: accessionNumber, formType, filingDate, reportDate (nullable, since
+  some forms have none), primaryDocumentUrl.
+  - The URL is built as https://www.sec.gov/Archives/edgar/data/{cik}/{accession
+    NoDashes}/{primaryDocument}, so the CIK is needed internally.
+  - Pick one accession format, dashed (0000320193-24-000123) or not, and accept
+    both as input.
+
+  5. Ticker handling
+
+  - Make it case-insensitive.
+  - Normalize share-class tickers: BRK.B, BRK-B and BRKB should resolve the same
+    way.
+  - Source: sec.gov/files/company_tickers.json. Cache it and refresh it daily.
+
+  6. EDGAR upstream realities
+
+  - data.sec.gov/submissions/CIK##########.json only holds the most recent ~1000
+    filings. Older ones are in extra files listed under filings.files.
+    Paginating past that limit means fetching those files.
+  - SEC requires a User-Agent header with contact info and allows at most 10 
+    requests per second. You need caching and request throttling on the outbound
+    side.
+
+  7. Error contract
+
+  ┌─────────────────────────────────────┬───────────┐
+  │                Case                 │  Status   │
+  ├─────────────────────────────────────┼───────────┤
+  │ Unknown ticker, or filing not found │ 404       │
+  ├─────────────────────────────────────┼───────────┤
+  │ Bad date, bad cursor or bad limit   │ 400       │
+  ├─────────────────────────────────────┼───────────┤
+  │ SEC down or slow                    │ 502 / 503 │
+  ├─────────────────────────────────────┼───────────┤
+  │ Rate limited                        │ 429       │
+  └─────────────────────────────────────┴───────────┘
+
+  Use one consistent error body for all of them.
+
+  8. Naming consistency
+
+  - filing (singular) vs filings: use plural for both, so
+    .../filings/{accessionNumber}.
+  - Use plural companies.
+  - Add a version prefix: api/v1.
+  - Query params: your form-type uses kebab-case. Pick one convention (kebab or
+    camelCase) and use it everywhere.
+
+  Revised sketch
+
+  GET /api/v1/companies/{ticker}
+  GET /api/v1/companies/{ticker}/filings?formType=10-K,8-K&startDate=2024-01-01&
+  endDate=2024-12-31&limit=50&cursor=...
+  GET /api/v1/companies/{ticker}/filings/{accessionNumber}
+  GET /api/v1/filings/{accessionNumber}        # optional, needs own 
+  accession→CIK index
+
+  The requirements don't need these, but they're cheap in Nest: @nestjs/swagger
+  for API docs, Zod validation through StandardSchemaValidationPipe,
+  @nestjs/cache-manager for caching, and @nestjs/resilience for retries against
+  SEC.
+
+  The decisions only you can make are #1 (whether to add a global accession
+  route) and #3 (which date the range filters on, and whether amendments match).
+
+✻ Brewed for 30s · done 16:08
+
+❯ 1. Keep the ticker in the route                                               
+  2. Okay, let's leave the paging out for now, we'll add it later.              
+  3. Date applies to the report date and the bounds are inclusive. Multiple     
+  form types per request, amendments not included (they need to be explicitly   
+  requested), matching is case insensitive.                                     
+  4. General outer wrapper of {data: ...|null, error: {message: ..., status:    
+  ...}|null, status: ...}, this goes for every response. Minimum suggested data 
+  contents look good for now.                                                   
+  5. Ticker handling is always case insensitive. Let's separate the ticker ->   
+  CIK into a separate service class.                                            
+  6. Let's stick to only the recent filings for now.                            
+  7. Error contract is specified above. Forward SEC error to end user in the    
+  error object.                                                                 
+  8. stick with plural, kebab-case. No version.                                 
+                                                                                
+  For the upstream fetching here is the structure:                              
+  A general rate limiter that wraps the "edgar service" (this is what talks to  
+  the upstream) and limits requests to 7 per second at most. Edgar service has  
+  hardcoded user-agent of something that works (look it up!).                   
+  Errors from edgar service, 404,400,500 etc are forwarded via the error object 
+  on our respose shape.                                                         
+  After converting a ticker to a CIK for use in the edgar service it needs to   
+  be padded, so we need a CIK padding service too that will be used in edgar    
+  service before requesting from upstream.                                      
+                                                                                
+  Keep the code clean and separate concerns as I've outlined. Use subagents and 
+  if there are any unclear things, ask me.                                      
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● User answered Claude's questions:
+  ⎿  · Top-level `status` in the response wrapper: what does it hold? → HTTP 
+     code, mirrored (Recommended)
+     · SEC requires User-Agent as '<Company/App name> <contact email>'. Which 
+     contact should the hardcoded User-Agent use? → Placeholder
+     · When the rate limit (7/s) is hit, what should happen to extra requests? →
+     Queue and delay (Recommended)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Both SEC endpoints returned 200 with the placeholder user agent, and an
+  unknown CIK gives a 404 with an XML body. I'm splitting the work across two
+  parallel agents with a fixed contract between them.
+
+● 2 background agents launched (↓ to manage)
+   ├ Build edgar upstream module
+   └ Build companies API + wrapper
+
+● Two agents running in parallel:
+  - Agent A: src/edgar/, which holds the rate limiter (7/s, queues extra
+    requests), CIK padding, the edgar service with the hardcoded User-Agent, and
+    the upstream error class.
+  - Agent B: src/common/ (the response wrapper and the global error filter) plus
+    src/companies/ (ticker-to-CIK service, controller, validation and e2e
+    tests).
+
+  Once both finish, I'll run the full integration and live check.
+
+✻ Churned for 1m 33s · done 16:23
+
+● Agent "Build edgar upstream module" finished · 2m 34s
+
+● Agent A (the src/edgar/ layer) is done: its 27 tests pass and lint is clean.
+  Agent B is still running, so the full check waits until it finishes.
+
+  The last type check showed one error in B's code:
+  src/companies/companies.controller.ts (TS1272), where a type in a decorated
+  method needs import type. B is still working on that file. I'll check it's
+  fixed in the full run.
+
+  One small change from the agreed design: an invalid CIK throws a plain error,
+  so it would come back as a 500. That can only happen if the ticker list has a
+  bad CIK.
+
+✻ Sautéed for 3s · done 16:25
+
+● Agent "Build companies API + wrapper" finished · 4m 12s
+
+  Ran 5 shell commands (ctrl+o to expand)
+
+● Background command "Start built API server on port 3917" failed with exit code
+127
+
+● The API is built and works against live SEC data: all three endpoints return
+  the agreed {data, error, status} wrapper. Nothing is committed yet.
+
+  Checks:
+  - Type check, lint and build are clean.
+  - 64 unit tests and 11 e2e tests pass.
+  - I started the built app on port 3917 and called it against real SEC data:
+    - GET /api/companies/aapl returns 200 with {cik: 320193, ticker: "AAPL", 
+      name: "Apple Inc."}. An unknown ticker gets a wrapped 404.
+    - GET /api/companies/aapl/filings?form-type=10-k&start-date=2023-01-01&end-d
+      ate=2025-12-31 returns three 10-Ks, newest first, with working sec.gov
+      links. Lowercase form types match. Asking for 10-K/A returns only
+      amendments.
+    - A bad date (2025-13-01) or a malformed accession number gets a 400 with a
+      readable message.
+    - A single filing is found whether you send the accession number with or
+      without dashes. One that isn't Apple's gets a 404.
+    - Unknown routes also come back wrapped as a 404.
+  - Rate limiter: I sent 20 requests at once for different tickers. All got 200,
+    and they took about 2.4 seconds in total. That fits the 7-per-second limit.
+  - I stopped the test server afterwards. The background task shows as "failed"
+    only because I stopped it.
+
+  Structure, as you outlined:
+  - src/edgar/:
+    - RateLimiterService: 7 requests per second, extra requests wait their turn
+      instead of failing.
+    - CikPaddingService: pads the CIK to 10 digits.
+    - EdgarService: the only code that talks to SEC. Every call goes through the
+      rate limiter, and it pads the CIK before requesting.
+    - EdgarUpstreamError: carries the SEC status code and message.
+  - src/companies/:
+    - TickerCikService: ticker-to-CIK lookup, case-insensitive. It keeps SEC's
+      ticker list in memory for 24 hours.
+    - CompaniesService: filters, sorts and builds the filing data.
+    - Controller and zod validation schemas.
+  - src/common/: the response wrapper, plus a global error filter that passes
+    SEC errors through with their status and message unchanged.
+
+  Things to know:
+  - User-Agent: the hardcoded value is edgar-api admin@example.com. It works
+    today, but SEC may start blocking contacts that aren't real. It's one
+    constant, EDGAR_USER_AGENT in src/edgar/edgar.service.ts.
+  - SEC error forwarding: this is covered by unit and e2e tests but wasn't
+    triggered live, because no real ticker produces an SEC error.
+  - Multiple instances: the rate limit and the ticker list live in memory, so
+    each running instance gets its own 7 per second.
+  - Invalid CIK: one would come back as a 500, not a 4xx. That can only happen
+    if SEC's ticker list contains a bad CIK.
+  - New dependency: zod was added for validation.
+
+  Do you want me to commit this on a feature branch? You're on master, and the
+  main branch is main.
+
+✻ Worked for 7m 31s · done 16:28
+
+❯ I looked at the code and it looks like you wrote tests, correct? Is there     
+  anything that is missing a test that might need one? We want to test business 
+  logic, not implementation                                                     
+  ⎿  UserPromptSubmit hook [node 
+     ${CLAUDE_PLUGIN_ROOT}/scripts/lifecycle/userPromptSubmit.mjs] timed out 
+     after 5s — output discarded. Raise the hook's "timeout" to allow more time.
+  ⎿  UserPromptSubmit hook [Tracking caveman mode...] timed out after 5s — 
+     output discarded. Raise the hook's "timeout" to allow more time.
+
+  Searched for 2 patterns, read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+● Yes, there are 75 tests in total (64 unit, 11 e2e), and they cover most of the
+  business rules. The gaps are mostly in error handling across endpoints, plus
+  a few edge cases in the filters. A few existing tests also check
+  implementation details rather than behavior.
+
+  Already covered
+
+  - Ticker lookup ignores case, and an unknown ticker gives a 404.
+  - Form types match regardless of case.
+  - Amendments only appear when requested, e.g. 10-K/A alongside 10-K.
+  - The date range applies to the report date and includes both ends; a range
+    can have only a start or only an end.
+  - Filings with no report date are excluded when a date filter is used, and
+    come back as null otherwise.
+  - Filings are sorted newest first, with ties broken by accession number.
+  - The primary document URL uses the unpadded CIK and the accession number
+    without dashes.
+  - Accession numbers work with or without dashes.
+  - Bad dates, a start date after the end date, and malformed accession numbers
+    give a 400.
+  - Unknown routes come back in the wrapper.
+  - The 7-per-second limit, including first-in, first-out queueing.
+  - CIK padding.
+  - Extracting the SEC error message, and mapping network failures to 502.
+
+  Missing behavior tests
+
+  1. SEC errors are only tested through one endpoint. You said all SEC errors
+     must be forwarded, but the only test is a 404 from the filings list.
+     Missing:
+     - The company endpoint when SEC's ticker list fails. That's a different
+       upstream call, so it's a different path.
+     - The single-filing endpoint when SEC fails.
+     - Status codes other than 404, such as a 500 from SEC, or a network failure
+       surfacing as 502 through the HTTP layer.
+  2. Unknown ticker on the filing routes. Only GET /companies/:ticker checks
+     the 404. The two filing routes should return the same 404 and shouldn't
+     call SEC for filings.
+  3. A filter that matches nothing returns 200 with data: [], not a 404. This is
+     a behavior choice and should be locked in with a test.
+  4. An empty form-type means no filter. ?form-type= or ?form-type=, should
+     return everything. The validation test checks that blank entries are
+     dropped, but not that the end result is "return all".
+  5. Ticker case on the filing routes. Case-insensitivity is only checked over
+     HTTP on the company route. A request like /companies/aapl/filings/... isn't
+     tested.
+  6. A failed request still uses up a rate-limit slot, and later queued requests
+     still run. The current test only checks that the error is passed back to
+     the caller.
+
+  Tests that check implementation, not behavior
+
+  These could be replaced with behavior tests or removed:
+  - edgar.service.spec, "routes every request through the rate limiter": it
+    counts schedule calls. A behavior test would fire 8 requests and check that
+    the 8th waits.
+  - companies.service.spec:
+    - "fetches submissions by CIK" checks getSubmissions was called with 320193.
+      The URL check in the same test already proves the right CIK was used.
+    - "without fetching submissions" checks a call didn't happen. It's arguably
+      reasonable, since it means fewer SEC requests, but it's still an
+      implementation detail.
+  - Unit tests for the response wrapper and error filter: the e2e tests already
+    check the wrapper on real responses, so these duplicate that coverage.
+  - The caching tests in ticker-cik.service.spec: these are borderline. Caching
+    wasn't one of your requirements. It does lower SEC load, which is
+    observable, so I'd keep them.
+
+  Should I add tests 1–6 and replace or remove the implementation-detail ones?
+  Most of them fit into the existing e2e file.
+
+✻ Churned for 1m 54s · done 16:34
+
+❯ Yes, add the missing tests. Leave the implementation detail tests for now.    
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Adding the rate limiter test, then the e2e tests.
+
+● Update(src\edgar\rate-limiter.service.spec.ts)
+  ⎿  Added 18 lines
+      75      await expect(Promise.all(runs)).resolves.toEqual(order);
+      76    });
+      77  
+      78 +  it('counts failed tasks against the limit and keeps running q
+         +ueued tasks', async () => {                                    
+      79 +    const failing = vi.fn(() => Promise.reject(new Error('boom'
+         +)));                                                           
+      80 +    const task = vi.fn(() => Promise.resolve());               
+      81 +                                                               
+      82 +    const failures = Array.from({ length: 7 }, () =>           
+      83 +      limiter.schedule(failing).catch(() => undefined),        
+      84 +    );                                                         
+      85 +    const queued = limiter.schedule(task);                     
+      86 +    await Promise.all(failures);                               
+      87 +                                                               
+      88 +    expect(failing).toHaveBeenCalledTimes(7);                  
+      89 +    expect(task).not.toHaveBeenCalled();                       
+      90 +                                                               
+      91 +    await vi.advanceTimersByTimeAsync(1000);                   
+      92 +    expect(task).toHaveBeenCalledTimes(1);                     
+      93 +    await expect(queued).resolves.toBeUndefined();             
+      94 +  });                                                          
+      95 +                                                               
+      96    it('propagates task results and errors', async () => {
+      97      await expect(limiter.schedule(() => Promise.resolve('ok')))
+          .resolves.toBe(
+      98        'ok',
+
+● Update(test\app.e2e-spec.ts)
+  ⎿  Added 83 lines, removed 5 lines
+      160      expect(res.body.error.status).toBe(400);
+      161    });
+      162  
+      163 -  it('forwards SEC errors to the caller', async () => {       
+      164 -    fakeEdgarService.getSubmissions.mockRejectedValue(        
+      165 -      new EdgarUpstreamError(404, 'SEC returned 404 Not Found'
+          -),                                                            
+      163 +  it('GET /api/companies/:ticker/filings returns an empty list
+          + when nothing matches', async () => {                         
+      164 +    const res = await get('/api/companies/AAPL/filings?form-ty
+          +pe=S-1').expect(                                              
+      165 +      200,                                                    
+      166      );
+      167  
+      168 -    const res = await get('/api/companies/AAPL/filings').expec
+          -t(404);                                                       
+      168 +    expect(res.body).toEqual({ data: [], error: null, status: 
+          +200 });                                                       
+      169 +  });                                                         
+      170  
+      171 +  it.each(['form-type=', 'form-type=,', 'form-type=%20,%20'])(
+      172 +    'GET /api/companies/:ticker/filings treats blank %s as no 
+          +filter',                                                      
+      173 +    async (query) => {                                        
+      174 +      const res = await get(`/api/companies/AAPL/filings?${que
+          +ry}`).expect(200);                                            
+      175 +                                                              
+      176 +      expect(res.body.data).toHaveLength(3);                  
+      177 +    },                                                        
+      178 +  );                                                          
+      179 +                                                              
+      180 +  it('GET /api/companies/:ticker/filings/:accessionNumber reso
+          +lves the ticker regardless of case', async () => {            
+      181 +    const res = await get(                                    
+      182 +      '/api/companies/aApL/filings/0000320193-24-000002',     
+      183 +    ).expect(200);                                            
+      184 +                                                              
+      185 +    expect(res.body.data.accessionNumber).toBe('0000320193-24-
+          +000002');                                                     
+      186 +  });                                                         
+      187 +                                                              
+      188 +  it.each([                                                   
+      189 +    '/api/companies/NOPE/filings',                            
+      190 +    '/api/companies/NOPE/filings/0000320193-24-000002',       
+      191 +  ])('GET %s returns 404 for an unknown ticker', async (path) 
+          +=> {                                                          
+      192 +    const res = await get(path).expect(404);                  
+      193 +                                                              
+      194      expect(res.body).toEqual({
+      195        data: null,
+      172 -      error: { message: 'SEC returned 404 Not Found', status: 
+          -404 },                                                        
+      196 +      error: { message: "Company with ticker 'NOPE' not found"
+          +, status: 404 },                                              
+      197        status: 404,
+      198      });
+      199    });
+      200  
+      201 +  describe('forwards SEC errors to the caller', () => {       
+      202 +    it.each([                                                 
+      203 +      [404, 'The specified key does not exist.'],             
+      204 +      [500, 'Internal Server Error'],                         
+      205 +      [502, 'Failed to reach SEC: fetch failed'],             
+      206 +    ])('from the filings list (%i)', async (status, message) =
+          +> {                                                           
+      207 +      fakeEdgarService.getSubmissions.mockRejectedValue(      
+      208 +        new EdgarUpstreamError(status, message),              
+      209 +      );                                                      
+      210 +                                                              
+      211 +      const res = await get('/api/companies/AAPL/filings').exp
+          +ect(status);                                                  
+      212 +                                                              
+      213 +      expect(res.body).toEqual({                              
+      214 +        data: null,                                           
+      215 +        error: { message, status },                           
+      216 +        status,                                               
+      217 +      });                                                     
+      218 +    });                                                       
+      219 +                                                              
+      220 +    it('from the single filing lookup', async () => {         
+      221 +      fakeEdgarService.getSubmissions.mockRejectedValue(      
+      222 +        new EdgarUpstreamError(503, 'Service Unavailable'),   
+      223 +      );                                                      
+      224 +                                                              
+      225 +      const res = await get(                                  
+      226 +        '/api/companies/AAPL/filings/0000320193-24-000002',   
+      227 +      ).expect(503);                                          
+      228 +                                                              
+      229 +      expect(res.body).toEqual({                              
+      230 +        data: null,                                           
+      231 +        error: { message: 'Service Unavailable', status: 503 }
+          +,                                                             
+      232 +        status: 503,                                          
+      233 +      });                                                     
+      234 +    });                                                       
+      235 +                                                              
+      236 +    it.each([                                                 
+      237 +      '/api/companies/AAPL',                                  
+      238 +      '/api/companies/AAPL/filings',                          
+      239 +      '/api/companies/AAPL/filings/0000320193-24-000002',     
+      240 +    ])('from the ticker list lookup on %s', async (path) => { 
+      241 +      fakeEdgarService.getCompanyTickers.mockRejectedValue(   
+      242 +        new EdgarUpstreamError(403, 'Forbidden'),             
+      243 +      );                                                      
+      244 +                                                              
+      245 +      const res = await get(path).expect(403);                
+      246 +                                                              
+      247 +      expect(res.body).toEqual({                              
+      248 +        data: null,                                           
+      249 +        error: { message: 'Forbidden', status: 403 },         
+      250 +        status: 403,                                          
+      251 +      });                                                     
+      252 +    });                                                       
+      253 +  });                                                         
+      254 +                                                              
+      255    it('wraps unknown routes in the response envelope', async ()
+            => {
+      256      const res = await get('/api/nothing-here').expect(404);
+      257  
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I added all six missing tests, and they all pass: 65 unit tests (was 64) and
+  24 e2e tests (was 11). Prettier and lint are clean. Nothing is committed, and
+  the implementation-detail tests are untouched.
+
+  src/edgar/rate-limiter.service.spec.ts (1 new test)
+  - Seven failing requests fill the per-second limit, and the 8th request waits
+    for a free slot and then still runs.
+
+  test/app.e2e-spec.ts (13 new tests)
+  - Empty result: ?form-type=S-1 returns 200 with data: [].
+  - Blank form type means no filter: form-type=, form-type=, and form-type= , 
+    all return all 3 filings.
+  - Ticker case on the filing routes: /companies/aApL/filings/... resolves.
+  - Unknown ticker: both filing routes return the wrapped 404 with the same
+    message as the company route.
+  - SEC errors forwarded:
+    - Filings list with SEC 404, 500 and 502, each checking the exact status and
+      message.
+    - Single filing lookup with SEC 503.
+    - SEC's ticker list failing (403) on all three endpoints.
+
+  The unknown-ticker tests only check the response. They don't check that no SEC
+  request for filings is made, because that would be an implementation detail.
+
+✻ Sautéed for 58s · done 16:37
+
+❯ commit this on a master, write a concise and descriptive commit message       
+
+  Ran 1 shell command (ctrl+o to expand)
+● I committed everything on master as 45b6e60, "Add company and filings API
+  backed by SEC EDGAR". It contains all 33 changed files and nothing has been
+  pushed.
+
+  The message body lists the three endpoints and what each does, the response
+  wrapper with SEC errors forwarded unchanged, the rate-limited SEC service with
+  CIK padding, the zod validation, and the test coverage.
+
+✻ Cooked for 7s · done 16:38
+
+※ recap: The SEC EDGAR company and filings API is built, tested and committed on master as 45b6e60, and it isn't pushed yet. Next step is to push it, or move the work onto `main` (the main branch) if that's where it should land. (disable recaps in /config)
+
+❯ Does the accession data that we return contain any information about which    
+  quarter it was filed in? I heard you should always return dates instead of    
+  just "Q1", "Q2" etc as this can mess up comparison for consumers due to       
+  companies using "different quarters".                                         
+
+● No. None of the data we return mentions a quarter. Each filing has five
+  fields:
+
+  accessionNumber, formType, filingDate, reportDate, primaryDocumentUrl
+
+  - filingDate is the date the filing was submitted to SEC.
+  - reportDate is the last day of the period the report covers, e.g. 2025-09-27
+    for Apple's FY2025 10-K. This is the field consumers should compare on.
+  - accessionNumber looks like it might hold a date, but it doesn't contain a
+    quarter. Its format is {filer ID}-{2-digit year}-{sequence}, e.g.
+    0000320193-25-000079. The 25 is the calendar year SEC received the filing,
+    and the 10-digit prefix is often a filing agent rather than the company.
+    It's an ID, not something to read dates from.
+
+  What you heard is right. Fiscal quarters don't line up across companies:
+  - Apple's fiscal year ends in late September, so its "Q1" is roughly October
+    to December.
+  - Microsoft's fiscal year ends June 30, so its "Q1" is July to September.
+  - Some companies use 52/53-week years that end on a weekday, so period end
+    dates move slightly from year to year (2024-09-28 vs 2025-09-27 for Apple).
+
+  Comparing "Q1" across companies would compare different calendar periods,
+  while reportDate puts every company on the same calendar.
+
+  SEC's submissions data doesn't include fiscal quarter labels anyway. Labels
+  like fy/fp only appear in SEC's financial-statement (XBRL) data, which we
+  don't call. So nothing needs to change. If you ever add fiscal-period info,
+  I'd return it alongside reportDate and never instead of it.
+
+✻ Crunched for 10s · done 16:48
+
+❯ /context 
+  ⎿  Context Usage
+     ⛀ ⛁ ⛁ ⛁ ⛁ ⛀ ⛀ ⛀ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   Opus 5.5
+     ⛁ ⛁ ⛁ ⛀ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   claude-opus-5-5
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   104.5k/1m tokens (10%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ 
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   Estimated usage by category
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt: 2.9k tokens (0.3%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System tools: 19.1k tokens (1.9%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ MCP server instructions: 1.5k tokens (0.2%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Custom agents: 471 tokens (0.0%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝   ⛁ Memory files: 2.4k tokens (0.2%)
+                                               ⛁ Skills: 9.9k tokens (1.0%)
+                                               ⛁ Messages: 68.2k tokens (6.8%)
+                                               ⛶ Free space: 862.5k (86.2%)
+                                               ⛝ Autocompact buffer: 33k tokens (3.3%)
+
+     Auto-compact window: 1m tokens
+
+     MCP tools · /mcp (loaded on-demand)
+     └ 220 tools · 0 tokens
+
+     Custom agents · .claude/agents/
+     └ 6 agents · 471 tokens
+
+     Memory files · /memory
+     └ 3 files · 2.4k tokens
+
+     Skills · /skills
+     └ 163 skills · 9.9k tokens
+
+     /context all to expand
+
+❯ Great, another quirk I found about the edgar api is that depending on which   
+  company is reporting things might have different key values in the documents, 
+  for example revenue might be tagged as "Revenues", "SalesRevenueNet" or       
+  something else. Given the edgar api endpoints we currently use and the data   
+  we're currently accessing, do we run any risk or falling into this? Do we     
+  need to implement a fallback system / mapping to ensure reliable access to    
+  the data we need?                                                             
+
+● No. The tag differences you're describing only affect SEC's
+  financial-statement data, and we don't use any of it.
+
+  What we use: sec.gov/files/company_tickers.json
+  What it contains: cik_str, ticker, title
+  Do the keys vary by company?: No. SEC builds this file itself.
+  ────────────────────────────────────────
+  What we use: data.sec.gov/submissions/CIK##########.json
+  What it contains: Company details plus filings.recent.{accessionNumber, 
+  filingDate, reportDate, form, primaryDocument}
+  Do the keys vary by company?: No. Same fixed structure for every company.
+
+  Where the problem actually lives: the financial-statement (XBRL) endpoints.
+  These are api/xbrl/companyfacts, companyconcept and frames, plus the XBRL
+  inside the filing documents. There, companies choose their own tags (Revenues,
+  SalesRevenueNet, RevenueFromContractWithCustomerExcludingAssessedTax…), tags
+  change over time as accounting rules change, and companies can define custom
+  tags. We don't call those endpoints or read the document contents. We only
+  return a link to the primary document.
+
+  What can vary in the data we do use:
+  - reportDate can be empty for some forms. This is already handled: it becomes
+    null, and those filings are left out when a date filter is used.
+  - Form type names aren't uniform. Variants like 10-KT (transition report) or
+    old forms like 10-K405 won't match a 10-K filter. That's consistent with
+    your rule of exact matches with no implied variants, but you may want to
+    document it.
+  - primaryDocument can be empty for some old or paper filings. In that case the
+    URL would end in /. That's a minor edge case and not handled today.
+
+  If you add financial data later (revenue, EPS and so on), you will need a
+  mapping:
+  - An ordered list of fallback tags per value you want, e.g. revenue tries
+    Revenues, then RevenueFromContractWithCustomerExcludingAssessedTax, then
+    SalesRevenueNet.
+  - Return which tag was actually used, so consumers can see where the number
+    came from.
+  - Check the unit (USD) and period length too, not just the tag name. A
+    quarterly figure and a year-to-date figure can share the same tag.
+
+  Nothing is needed today.
+
+✻ Worked for 11s · done 16:52
+
+❯ Wonderful. Then let's the next step for the API - a cache layer. We don't     
+  want to hit the upstream every time someone requests data. In-memory cache is 
+  enough but I want your help in deciding where to put the cache layer, list    
+  pros and cons of putting it inside each of our existing services or the       
+  controller itself and let me decide which one to go with.                     
+
+● The best spot is the edgar service, just before requests reach SEC, so a cache
+  hit never touches SEC or the rate limiter. Each option below is compared
+  against the two calls we make to SEC:
+
+  - Ticker list: fetched by getCompanyTickers() and used by every endpoint. It's
+    already cached for 24h inside TickerCikService.
+  - Company filings: fetched by getSubmissions(cik). Both filing endpoints call
+    it with the same CIK, and only filter the result differently afterwards.
+
+  1. Controller (cache the HTTP response, e.g. Nest's CacheInterceptor)
+
+  Pros
+  - Least code. Nest has a built-in interceptor for this
+    (@nestjs/cache-manager).
+  - A hit skips everything, including filtering and wrapping.
+
+  Cons
+  - The cache key is the full URL. ?form-type=10-K, ?form-type=10-k and
+    ?form-type=8-K,10-K are all separate entries for the same SEC data, so a new
+    filter combination still hits SEC.
+  - The list endpoint and the single-filing endpoint can't share cached data.
+  - The response wrapper and errors make this harder. Error responses must not
+    be cached, and that takes extra care with the error filter.
+  - Caching becomes an HTTP concern instead of a data concern.
+
+  2. CompaniesService
+
+  Pros
+  - Knows the domain: it can cache the converted filings per CIK and filter them
+    afterwards.
+  - Both filing endpoints share one entry per company.
+
+  Cons
+  - Mixes caching into business logic, which goes against the separation of
+    concerns you asked for.
+  - The ticker list is still cached separately in TickerCikService, so there'd
+    be two caching mechanisms in two places.
+  - Any future code that calls EdgarService directly gets no cache.
+
+  3. TickerCikService (extend what's there)
+
+  Pros
+  - A cache already exists there: 24h, and concurrent requests share one load.
+
+  Cons
+  - It only resolves ticker to CIK. Filings don't go through it, so it can't
+    cache them without taking on a second job.
+
+  4. EdgarService (cache raw SEC responses, keyed by URL or CIK)
+
+  Pros
+  - One place for both SEC calls. Every endpoint, filter combination and future
+    caller benefits.
+  - The key is small and predictable: one entry per company plus one for the
+    ticker list. Filters don't multiply entries.
+  - A hit returns before the rate limiter, so it uses no SEC capacity.
+  - TickerCikService could drop its own cache and become a simple lookup.
+  - Easy to keep errors out: only successful responses get stored.
+
+  Cons
+  - EdgarService now does two jobs: talking to SEC and caching.
+  - The cache holds raw SEC data, so every hit still filters and converts.
+    That's cheap: about 1000 rows in memory.
+  - The full submissions file is the largest thing we store. The recent section
+    alone is about 1000 filings, roughly 0.5–1 MB per company. You need a limit
+    on entries or an eviction rule.
+
+  5. Separate caching wrapper around EdgarService
+
+  This keeps all of option 4's benefits but puts caching in its own class, the
+  same way the rate limiter is its own class. Controllers and services call the
+  cached version, which calls the real EdgarService on a miss.
+
+  Pros
+  - Same benefits as option 4.
+  - Each class has one job: talking to SEC, rate limiting, caching. That matches
+    the structure you set up.
+  - Caching can be tested on its own with a fake EdgarService.
+
+  Cons
+  - One more class, plus some wiring so callers get the cached version.
+
+  Decisions for any option
+
+  - How long to keep data: about 24h for the ticker list. For filings, roughly
+    5–15 minutes is a reasonable trade-off, since companies file throughout the
+    day.
+  - Never cache errors.
+  - Share in-flight requests: when several requests for the same company arrive
+    at once, make one SEC call. Without this, the cache misses that happen while
+    a request is in flight all go to SEC.
+  - Memory limit: cap the number of companies held and evict the least recently
+    used.
+
+  Recommendation: option 5, or option 4 if you don't want the extra class.
+  Options 1 and 2 cache at the wrong level for how our data is shaped.
+
+  Which one do you want?
+
+✻ Crunched for 19s · done 16:55
+
+❯ Agreed, let's do option 5. This also sets up nicely for paging later. For now 
+  keep the data according to your suggestions and add a note about cache        
+  invalidation as a later todo. Never cache errors and share in-flight          
+  requests. Memory limit is not relevant for now, add a note about it for       
+  later.                                                                        
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Write(src\edgar\cached-edgar.service.ts)
+  ⎿  Wrote 73 lines to src\edgar\cached-edgar.service.ts
+       1 import { Injectable } from '@nestjs/common';
+       2 import { CikPaddingService } from './cik-padding.service.js';
+       3 import { EdgarService } from './edgar.service.js';
+         gar.types.js';
+       5 
+       6 // The ticker list changes rarely; filings arrive throughout the
+          day.
+       8 export const SUBMISSIONS_TTL_MS = 10 * 60 * 1000;
+       9 
+      10 const COMPANY_TICKERS_KEY = 'company-tickers';
+     … +75 lines (ctrl+o to expand)
+
+● Write(src\edgar\edgar.module.ts)
+  ⎿  Added 9 lines, removed 2 lines
+       1  import { Module } from '@nestjs/common';
+       2 +import { CachedEdgarService } from './cached-edgar.service.js';
+       3  import { CikPaddingService } from './cik-padding.service.js';
+       4  import { EdgarService } from './edgar.service.js';
+       5  import { RateLimiterService } from './rate-limiter.service.js';
+       6  
+       7 +// Consumers use CachedEdgarService; EdgarService is only reach
+         +ed on a miss.                                                  
+       8  @Module({
+       7 -  providers: [EdgarService, CikPaddingService, RateLimiterServi
+         -ce],                                                           
+       8 -  exports: [EdgarService, CikPaddingService, RateLimiterService
+         -],                                                             
+       9 +  providers: [                                                 
+      10 +    CachedEdgarService,                                        
+      11 +    EdgarService,                                              
+      12 +    CikPaddingService,                                         
+      13 +    RateLimiterService,                                        
+      14 +  ],                                                           
+      15 +  exports: [CachedEdgarService, CikPaddingService],            
+      16  })
+      17  export class EdgarModule {}
+
+● Write(src\companies\ticker-cik.service.ts)
+  ⎿  Added 10 lines, removed 41 lines
+       1  import { Injectable, NotFoundException } from '@nestjs/common';
+       2 -import { EdgarService } from '../edgar/edgar.service.js';      
+       2 +import { CachedEdgarService } from '../edgar/cached-edgar.servi
+         +ce.js';                                                        
+       3  import { Company } from './company.js';
+       4  
+       5 -const CACHE_TTL_MS = 24 * 60 * 60 * 1000;                      
+       6 -                                                               
+       7 -/**                                                            
+       8 - * Resolves tickers to CIKs using SEC's company ticker list. Th
+         -e list is                                                      
+       9 - * large and changes rarely, so it is cached in memory.        
+      10 - */                                                            
+       5 +/** Resolves tickers to CIKs using SEC's company ticker list. *
+         +/                                                              
+       6  @Injectable()
+       7  export class TickerCikService {
+      13 -  private companies?: Map<string, Company>;                    
+      14 -  private loadedAt = 0;                                        
+      15 -  private loading?: Promise<Map<string, Company>>;             
+       8 +  constructor(private readonly edgar: CachedEdgarService) {}   
+       9  
+      17 -  constructor(private readonly edgarService: EdgarService) {}  
+      18 -                                                               
+      10    async resolve(ticker: string): Promise<Company> {
+      20 -    const companies = await this.getCompanies();               
+      21 -    const company = companies.get(ticker.toUpperCase());       
+      22 -    if (!company) {                                            
+      11 +    const wanted = ticker.toUpperCase();                       
+      12 +    const tickers = await this.edgar.getCompanyTickers();      
+      13 +    const entry = Object.values(tickers).find(                 
+      14 +      (candidate) => candidate.ticker.toUpperCase() === wanted,
+      15 +    );                                                         
+      16 +    if (!entry) {                                              
+      17        throw new NotFoundException(`Company with ticker '${ticke
+          r}' not found`);
+      18      }
+      25 -    return company;                                            
+      19 +    return { cik: entry.cik_str, ticker: wanted, name: entry.ti
+         +tle };                                                         
+      20    }
+      27 -                                                               
+      28 -  private getCompanies(): Promise<Map<string, Company>> {      
+      29 -    if (this.companies && Date.now() - this.loadedAt < CACHE_TT
+         -L_MS) {                                                        
+      30 -      return Promise.resolve(this.companies);                  
+      31 -    }                                                          
+      32 -                                                               
+      33 -    // Share one in-flight load between concurrent callers.    
+      34 -    this.loading ??= this.loadCompanies().finally(() => {      
+      35 -      this.loading = undefined;                                
+      36 -    });                                                        
+      37 -    return this.loading;                                       
+      38 -  }                                                            
+      39 -                                                               
+      40 -  private async loadCompanies(): Promise<Map<string, Company>> 
+         -{                                                              
+      41 -    const tickers = await this.edgarService.getCompanyTickers()
+         -;                                                              
+      42 -    const companies = new Map<string, Company>();              
+      43 -    for (const entry of Object.values(tickers)) {              
+      44 -      const ticker = entry.ticker.toUpperCase();               
+      45 -      companies.set(ticker, { cik: entry.cik_str, ticker, name:
+         - entry.title });                                               
+      46 -    }                                                          
+      47 -                                                               
+      48 -    this.companies = companies;                                
+      49 -    this.loadedAt = Date.now();                                
+      50 -    return companies;                                          
+      51 -  }                                                            
+      21  }
+
+● Bash(sed -i "s#import { EdgarService } from
+      '../edgar/edgar.service.js';#import { CachedEdgarService } from
+      '../edgar/cached-edgar.service.js';#; s#private readonly…)
+  ⎿  src/companies/companies.service.spec.ts:2:import type { CachedEdgarSer
+     vice } from '../edgar/cached-edgar.service.js';
+     src/companies/companies.service.spec.ts:51:      { getSubmissions } as
+     … +13 lines (ctrl+o to expand)
+  ⎿  Updated src\companies\companies.service.spec.ts (+2 -2)
+      1  import { NotFoundException } from '@nestjs/common';
+      2 -import type { EdgarService } from '../edgar/edgar.service.js';  
+      2 +import type { CachedEdgarService } from '../edgar/cached-edgar.s
+        +ervice.js';                                                     
+      3  import type { EdgarRecentFilings } from '../edgar/edgar.types.js
+         ';
+      4  import { CompaniesService } from './companies.service.js';
+      5  import type { TickerCikService } from './ticker-cik.service.js';
+     ...
+      48      });
+      49      service = new CompaniesService(
+      50        { resolve } as unknown as TickerCikService,
+      51 -      { getSubmissions } as unknown as EdgarService,           
+      51 +      { getSubmissions } as unknown as CachedEdgarService,     
+      52      );
+      53    });
+      54  
+  ⎿  Updated src\companies\companies.service.ts (+2 -2)
+      1  import { Injectable, NotFoundException } from '@nestjs/common';
+      2 -import { EdgarService } from '../edgar/edgar.service.js';       
+      2 +import { CachedEdgarService } from '../edgar/cached-edgar.servic
+        +e.js';                                                          
+      3  import { EdgarRecentFilings } from '../edgar/edgar.types.js';
+      4  import { Company } from './company.js';
+      5  import { Filing, FilingFilters } from './filing.js';
+     ...
+      11  export class CompaniesService {
+      12    constructor(
+      13      private readonly tickerCikService: TickerCikService,
+      14 -    private readonly edgarService: EdgarService,               
+      14 +    private readonly edgarService: CachedEdgarService,         
+      15    ) {}
+      16  
+      17    getCompany(ticker: string): Promise<Company> {
+  ⎿  Updated src\companies\ticker-cik.service.spec.ts (+2 -2)
+      1  import { NotFoundException } from '@nestjs/common';
+      2 -import type { EdgarService } from '../edgar/edgar.service.js';  
+      2 +import type { CachedEdgarService } from '../edgar/cached-edgar.s
+        +ervice.js';                                                     
+      3  import { TickerCikService } from './ticker-cik.service.js';
+      4  
+      5  describe('TickerCikService', () => {
+     ...
+      13      });
+      14      service = new TickerCikService({
+      15        getCompanyTickers,
+      16 -    } as unknown as EdgarService);                             
+      16 +    } as unknown as CachedEdgarService);                       
+      17    });
+      18  
+      19    afterEach(() => {
+
+● Removing the old cache tests from the ticker spec and adding the cached
+  service spec.
+
+● Update(src\companies\ticker-cik.service.spec.ts)
+  ⎿  Removed 31 lines
+      36      );
+      37    });
+      38  
+      39 -  it('caches the ticker list between calls', async () => {     
+      40 -    await service.resolve('AAPL');                             
+      41 -    await service.resolve('BRK-B');                            
+      42 -                                                               
+      43 -    expect(getCompanyTickers).toHaveBeenCalledTimes(1);        
+      44 -  });                                                          
+      45 -                                                               
+      46 -  it('shares one load between concurrent calls', async () => { 
+      47 -    await Promise.all([service.resolve('AAPL'), service.resolve
+         -('aapl')]);                                                    
+      48 -                                                               
+      49 -    expect(getCompanyTickers).toHaveBeenCalledTimes(1);        
+      50 -  });                                                          
+      51 -                                                               
+      52 -  it('reloads the ticker list after 24 hours', async () => {   
+      53 -    vi.useFakeTimers();                                        
+      54 -    await service.resolve('AAPL');                             
+      55 -                                                               
+      56 -    vi.advanceTimersByTime(24 * 60 * 60 * 1000);               
+      57 -    await service.resolve('AAPL');                             
+      58 -                                                               
+      59 -    expect(getCompanyTickers).toHaveBeenCalledTimes(2);        
+      60 -  });                                                          
+      61 -                                                               
+      62 -  it('retries the load after a failure', async () => {         
+      63 -    getCompanyTickers.mockRejectedValueOnce(new Error('boom'));
+      64 -                                                               
+      65 -    await expect(service.resolve('AAPL')).rejects.toThrow('boom
+         -');                                                            
+      66 -    await expect(service.resolve('AAPL')).resolves.toMatchObjec
+         -t({                                                            
+      67 -      cik: 320193,                                             
+      68 -    });                                                        
+      69 -  });                                                          
+      39  });
+
+● Update(src\companies\ticker-cik.service.spec.ts)
+  ⎿  Removed 4 lines
+      16      } as unknown as CachedEdgarService);
+      17    });
+      18  
+      19 -  afterEach(() => {                                            
+      20 -    vi.useRealTimers();                                        
+      21 -  });                                                          
+      22 -                                                               
+      19    it('resolves a ticker regardless of case', async () => {
+      20      const expected = { cik: 320193, ticker: 'AAPL', name: 'Appl
+          e Inc.' };
+      21  
+
+● Write(src\edgar\cached-edgar.service.spec.ts)
+  ⎿  Wrote 127 lines to src\edgar\cached-edgar.service.spec.ts
+       1 import {
+       2   CachedEdgarService,
+       3   COMPANY_TICKERS_TTL_MS,
+       4   SUBMISSIONS_TTL_MS,
+       5 } from './cached-edgar.service.js';
+       6 import { CikPaddingService } from './cik-padding.service.js';
+       7 import { EdgarUpstreamError } from './edgar-upstream.error.js';
+       8 import type { EdgarService } from './edgar.service.js';
+       9 
+      10 describe('CachedEdgarService', () => {
+     … +129 lines (ctrl+o to expand)
+
+  Ran 7 shell commands (ctrl+o to expand)
+
+● Background command "Start built API on port 3918" failed with exit code 127
+
+● The cache wrapper is in place and works against live SEC data: repeat requests
+  now come back in about 3 ms instead of 300–500 ms. Nothing is committed yet.
+
+  New: src/edgar/cached-edgar.service.ts (CachedEdgarService)
+  - It sits in front of EdgarService with the same two methods. A cache hit
+    never reaches SEC or the rate limiter.
+  - How long data is kept: the ticker list for 24 hours, a company's filings for
+    10 minutes.
+  - Errors are never cached. A failed SEC call is passed to the caller and the
+    next request tries SEC again.
+  - Concurrent requests share one SEC call. If that call fails, every waiting
+    request gets the same error.
+  - A company's filings are cached under its padded CIK, so 320193 and
+    "0000320193" share one entry.
+  - The two later notes are TODO comments in the class's doc comment:
+    - Cache invalidation: entries only expire when their time runs out. Add
+      early removal later, e.g. when a new filing is known to exist.
+    - Memory limit: entries are never removed except by expiry. Add a cap (e.g.
+      least-recently-used) before serving many companies.
+
+  Other changes
+  - EdgarModule now only exports CachedEdgarService (plus CikPaddingService).
+    Nothing outside the module can reach EdgarService, so nothing can skip the
+    cache by mistake.
+  - TickerCikService no longer has its own cache and is now just a lookup. Its
+    four caching tests moved to the new cache spec.
+  - CompaniesService now uses CachedEdgarService.
+  - The e2e tests still replace the real EdgarService with a fake, so the cache
+    is part of every e2e test.
+
+  Checks:
+  - Type check and build are clean. Lint is clean when run directly; an earlier
+    npm run lint call exited 1 but printed no errors, and running oxlint
+    directly exits 0.
+  - 70 unit tests and 24 e2e tests pass. That includes 9 new cache tests: hits,
+    expiry at the exact boundary, separate entries per company, concurrent
+    requests sharing a call, errors not cached, and an invalid CIK never
+    reaching SEC.
+
+  Live check against SEC:
+
+  ┌──────────────────────────────────────────────┬────────┐
+  │                   Request                    │  Time  │
+  ├──────────────────────────────────────────────┼────────┤
+  │ /companies/aapl, first call                  │ 340 ms │
+  ├──────────────────────────────────────────────┼────────┤
+  │ /companies/aapl, second call                 │ 3 ms   │
+  ├──────────────────────────────────────────────┼────────┤
+  │ /filings?form-type=10-K, first call          │ 524 ms │
+  ├──────────────────────────────────────────────┼────────┤
+  │ /filings?form-type=8-K, other filter, cached │ 4 ms   │
+  ├──────────────────────────────────────────────┼────────┤
+  │ Single-filing lookup, cached                 │ 3 ms   │
+  └──────────────────────────────────────────────┴────────┘
+
+  I also sent 20 requests at once for MSFT filings. All got 200 within 555 ms,
+  which means they shared one SEC call; without sharing, 20 calls at 7 per
+  second would take over 2 seconds. I stopped the test server afterwards, which
+  is why its background task shows as "failed".
+
+  Should I commit this on master?
+
+✻ Sautéed for 2m 29s · done 17:03
+
+❯ yes, commit it on master                                                      
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I committed the cache layer on master as e19f04a, "Add in-memory cache in
+  front of SEC EDGAR requests". It includes all 7 changed files, nothing is left
+  uncommitted, and nothing has been pushed.
+
+✻ Churned for 6s · done 17:05
+
+❯ /context   ⎿  Context Usage
+     ⛀ ⛁ ⛁ ⛁ ⛁ ⛀ ⛀ ⛀ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   Opus 5.5
+     ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   claude-opus-5-5
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   138.2k/1m tokens (14%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ 
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   Estimated usage by category
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt: 2.9k tokens (0.3%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System tools: 19.1k tokens (1.9%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ MCP server instructions: 1.5k tokens (0.2%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ Custom agents: 471 tokens (0.0%)
+     ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝ ⛝   ⛁ Memory files: 2.4k tokens (0.2%)
+                                               ⛁ Skills: 9.9k tokens (1.0%)
+                                               ⛁ Messages: 101.9k tokens (10.2%)
+                                               ⛶ Free space: 828.8k (82.9%)
+                                               ⛝ Autocompact buffer: 33k tokens (3.3%)
+
+     Auto-compact window: 1m tokens
+
+     MCP tools · /mcp (loaded on-demand)
+     └ 220 tools · 0 tokens
+
+     Custom agents · .claude/agents/
+     └ 6 agents · 471 tokens
+
+     Memory files · /memory
+     └ 3 files · 2.4k tokens
+
+     Skills · /skills
+     └ 163 skills · 9.9k tokens
+
+     /context all to expand
+
+❯ Now let's tackle the paging for the listFilings endpoint. Earlier I was       
+  thinking about cursor paging because of the performance. Help me weight       
+  cursor based, offset + limit based and the page + size based paging for this. 
+  Assume the api will be used mainly by other software and not so much by       
+  humans.                                                                       
+
+● I recommend cursor-based paging. Performance isn't the reason, though: with
+  our data, the three styles perform the same. The real differences are what
+  consumers see when new filings arrive mid-iteration, and what happens once we
+  page past the ~1000 recent filings.
+
+  Why performance doesn't decide it
+
+  The usual reason to prefer cursor paging is database cost: OFFSET 50000 makes
+  the database scan and throw away 50,000 rows, while a cursor seeks straight to
+  an index position. We don't have a database. A company's ~1000 recent filings
+  are already in memory (cached), and every request filters and sorts them
+  anyway, so taking a page out of the result costs the same whichever style we
+  use.
+
+  The three options
+
+  Cursor (?limit=50&cursor=<opaque>). The cursor encodes where the last page
+  ended, i.e. the last (filingDate, accessionNumber) returned. Together those
+  two values identify a filing uniquely.
+
+  Pros:
+  - Stable while data changes. New filings appear at the top, since the list is
+    newest first. A cursor continues from a specific filing, so a consumer
+    partway through never sees duplicates or gaps. This matters because cached
+    filings refresh every 10 minutes, and a long-running sync can span a
+    refresh.
+  - Works past the recent filings. SEC splits older filings into extra files,
+    each labelled with a filing date range. A cursor holding a date tells us
+    which file to read next. With offsets and a form-type filter, finding "item
+    500" means reading and filtering every earlier file first.
+  - Matches how software reads lists: follow nextCursor until it's null. Clients
+    need no page arithmetic.
+
+  Cons:
+  - No jumping to page N, and no fetching pages in parallel (each page needs the
+    previous page's cursor).
+  - The token must be encoded and checked: a bad cursor gives a 400. You also
+    have to decide what happens when a cursor is sent with different filters.
+  - Slightly harder to try out by hand, because the cursor is an opaque string.
+
+  Offset + limit (?offset=100&limit=50).
+
+  Pros:
+  - Simple and transparent. Clients can fetch pages in parallel or jump
+    anywhere.
+  - Easy to implement on in-memory data: one slice.
+
+  Cons:
+  - Data changes cause duplicates. If 2 new filings arrive mid-sync, every later
+    position moves down by 2, so the next page repeats 2 already-seen filings.
+    Gaps would need deletions, which SEC rarely does. Machine consumers can drop
+    duplicates by accession number, but every client has to know to do that.
+  - Doesn't work well past the recent filings combined with filters (see above).
+
+  Page + size (?page=3&size=50).
+  This is offset + limit with page-number arithmetic. It has the same pros and
+  cons, plus one more con: it's less flexible. Changing size partway through
+  misaligns the pages. Page numbers mainly suit human-facing interfaces ("page 3
+  of 12"), which isn't your audience.
+
+  Summary
+
+  ┌───────────────────────────┬─────────┬─────────────────┬─────────────────┐
+  │                           │ Cursor  │ Offset + limit  │   Page + size   │
+  ├───────────────────────────┼─────────┼─────────────────┼─────────────────┤
+  │ Speed on our data         │ Same    │ Same            │ Same            │
+  ├───────────────────────────┼─────────┼─────────────────┼─────────────────┤
+  │ New filings mid-sync      │ Stable  │ Duplicates      │ Duplicates      │
+  ├───────────────────────────┼─────────┼─────────────────┼─────────────────┤
+  │ Paging past the recent    │ Natural │ Hard with       │ Hard with       │
+  │ filings                   │         │ filters         │ filters         │
+  ├───────────────────────────┼─────────┼─────────────────┼─────────────────┤
+  │ Jump or parallel fetch    │ No      │ Yes             │ Yes             │
+  ├───────────────────────────┼─────────┼─────────────────┼─────────────────┤
+  │ Fit for machine consumers │ Best    │ Good            │ Weakest         │
+  └───────────────────────────┴─────────┴─────────────────┴─────────────────┘
+
+  A total count is cheap with any of them, since everything is in memory, so the
+  choice doesn't depend on that.
+
+  Two decisions before I build it
+
+  1. Where paging info goes in the response. The wrapper is {data, error, 
+     status}. Options:
+     - data: { items: [...], nextCursor }
+     - Keep data: [...] and add a top-level page: { nextCursor, limit }. That's
+       a new top-level field, so it changes your agreed wrapper.
+  2. Limits: I suggest a default limit of 50 and a maximum of 200. When a cursor
+     arrives with different filters than the ones that created it, should we
+     return a 400 or just ap
+
+❯ Or if there are other ways of paging that I didn't list that might be a good  
+  fit, include them in your comparison                                          
+
+● These are the other approaches worth considering, plus an updated
+  recommendation. (My previous reply was also cut off mid-sentence; the open
+  decisions are repeated in full at the end.)
+
+  Other approaches
+
+  4. Transparent cursor: "items after this ID" 
+  (?limit=50&after=0000320193-24-000123)
+  This is what Stripe does (starting_after=<id>). It works like a cursor, but
+  the position is a readable accession number instead of an opaque token.
+  - Pros:
+    - Same stability as an opaque cursor: new filings don't shift anything.
+    - No encoding and no checking of a token, so it's easy to debug and try out
+      by hand.
+    - Clients can build it themselves from the last item they received.
+  - Cons:
+    - We have to find that accession number to know where to continue. That's
+      trivial in memory. Past the recent filings it's awkward, because finding
+      which older SEC file holds it needs the filing date, and the accession
+      number only contains the year.
+    - Clients can't tell whether we sort by filing date, report date or
+      accession number. With an opaque cursor that detail stays hidden.
+    - If the referenced filing ever disappears (very rare at SEC), the position
+      is lost and we have to return a 400.
+
+  5. Date-window paging (client narrows start-date/end-date itself)
+  There's no paging feature; clients use the date filters we already have.
+  - Pros: nothing to build, and no state on either side.
+  - Cons:
+    - Page sizes are uneven.
+    - Our date filter is on report date but the sort is on filing date, so the
+      windows don't line up with the order clients see.
+    - Every client has to write its own loop.
+
+  Not a fit on its own.
+
+  6. Snapshot paging (the server keeps the result set; Elasticsearch scroll / 
+  point-in-time style)
+  The first request freezes the result and gets a snapshot ID, and later pages
+  read from that frozen copy.
+  - Pros: perfectly consistent, even when cached data refreshes mid-sync.
+  - Cons:
+    - State on the server: memory, expiry and cleanup.
+    - Breaks with several instances unless the snapshots are shared.
+    - Much more work than the problem calls for: cursors already handle new
+      filings at the top, and SEC rarely edits or deletes filings.
+
+  Overkill here.
+
+  7. "Changes since" sync (?filed-since=2024-05-01)
+  This isn't paging; it's a way to skip it. Clients that keep a local copy fetch
+  only what's new since their last run.
+  - Pros: the most efficient pattern for software that keeps a copy of the data.
+    After the first full read, each sync is tiny.
+  - Cons: it adds to paging rather than replacing it, since the first full read
+    still needs paging. It also needs a filing-date filter; today we only filter
+    on report date.
+
+  Worth adding later.
+
+  Ways to send the next-page position (they work with any style above)
+  - A next URL in the response body: a ready-to-call URL that clients just
+    follow. This fits machine consumers best: it needs no URL building, and it
+    keeps the filters and limit consistent between pages automatically.
+  - Link: <…>; rel="next" header (RFC 8288): the same idea in a standard HTTP
+    header, which some HTTP clients and SDK generators follow automatically.
+    It's less visible than a body field.
+  - Range: items=0-49 header: rare, and few tools support it. Skip.
+
+  Updated comparison
+
+  ┌─────────────┬─────────┬─────────┬────────────┬────────────┬────────────┐
+  │             │ Opaque  │ After   │ Offset +   │  Page +    │  Snapshot  │
+  │             │ cursor  │ this ID │   limit    │    size    │            │
+  ├─────────────┼─────────┼─────────┼────────────┼────────────┼────────────┤
+  │ New filings │ Stable  │ Stable  │ Duplicates │ Duplicates │ Fully      │
+  │  mid-sync   │         │         │            │            │ consistent │
+  ├─────────────┼─────────┼─────────┼────────────┼────────────┼────────────┤
+  │ Paging past │         │         │ Hard with  │ Hard with  │            │
+  │  recent     │ Natural │ Awkward │ filters    │ filters    │ Natural    │
+  │ filings     │         │         │            │            │            │
+  ├─────────────┼─────────┼─────────┼────────────┼────────────┼────────────┤
+  │ Jump or     │         │         │            │            │            │
+  │ parallel    │ No      │ No      │ Yes        │ Yes        │ No         │
+  │ fetch       │         │         │            │            │            │
+  ├─────────────┼─────────┼─────────┼────────────┼────────────┼────────────┤
+  │ Debuggable  │ Low     │ High    │ High       │ High       │ Low        │
+  ├─────────────┼─────────┼─────────┼────────────┼────────────┼────────────┤
+  │ Server      │ None    │ None    │ None       │ None       │ Yes        │
+  │ state       │         │         │            │            │            │
+  ├─────────────┼─────────┼─────────┼────────────┼────────────┼────────────┤
+  │ Fit for     │         │ Very    │            │            │            │
+  │ machine     │ Best    │ good    │ Good       │ Weakest    │ Overkill   │
+  │ consumers   │         │         │            │            │            │
+  └─────────────┴─────────┴─────────┴────────────┴────────────┴────────────┘
+
+  Recommendation
+
+  Use an opaque cursor plus a ready-made next URL in the response, and add
+  "changes since" sync later as a separate feature. The opaque cursor beats
+  "after this ID" mainly because it keeps paging past the recent filings
+  possible without changing the API.
+
+  Open decisions
+
+  1. Where paging info goes in the response:
+     - a) data: { items: [...], nextCursor, next }. This keeps your top-level
+       wrapper unchanged, but makes the filings list's data a different shape
+       from the other endpoints.
+     - b) Keep data: [...] and add a top-level page: { nextCursor, next, limit 
+       }. That changes the wrapper you agreed for every response.
+  2. Limits: I suggest a default limit of 50 and a maximum of 200.
+  3. Cursor sent with different filters:
+     - Reject with a 400. This is safer and catches client bugs early.
+     - Use the new filters and keep the cursor's position. This is more
+       forgiving, but results can be surprising.
+
+     I'd go with the 400.
+  4. Total count: cheap for us. Should we include it in the response?
+
+✻ Baked for 27s · done 17:10
+
+❯ go with opaque cursor, option 1a - keep the top level wrapper, limits look    
+  good, reject with 400 sounds good, include message about why it's rejected,   
+  include total. I like to have this as a pagination section in the response so 
+  let's do that.                                                                
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Write(src\common\pagination.ts)
+  ⎿  Wrote 45 lines to src\common\pagination.ts
+      1 /** One page of results, as produced by a service. */
+      2 export interface Page<T> {
+      3   items: T[];
+      4   limit: number;
+      5   /** Number of results across all pages. */
+      6   total: number;
+      7   /** Opaque cursor for the next page, or null on the last page. 
+        */
+      8   nextCursor: string | null;
+      9 }
+     … +40 lines (ctrl+o to expand)
+
+● Write(src\companies\filing-cursor.ts)
+  ⎿  Wrote 87 lines to src\companies\filing-cursor.ts
+       1 import { BadRequestException } from '@nestjs/common';
+       2 import type { Filing, FilingFilters } from './filing.js';
+       3 
+       4 /** Where a page ended, in the list's newest-first order. */
+       5 export type FilingPosition = Pick<Filing, 'filingDate' | 'access
+       6 
+       7 interface CursorPayload {
+       8   filingDate: string;
+       9   accessionNumber: string;
+      10   filters: string;
+     … +86 lines (ctrl+o to expand)
+
+● Update(src\companies\filing.ts)
+  ⎿  Added 8 lines
+      11    startDate?: string;
+      12    endDate?: string;
+      13  }
+      14 +                                                               
+      15 +export interface PageRequest {                                 
+      16 +  limit: number;                                               
+      17 +  cursor?: string;                                             
+      18 +}                                                              
+      19 +                                                               
+      20 +export const DEFAULT_PAGE_LIMIT = 50;                          
+      21 +export const MAX_PAGE_LIMIT = 200;                             
+
+● Update(src\companies\companies.service.ts)
+  ⎿  Added 12 lines, removed 1 line
+       1  import { Injectable, NotFoundException } from '@nestjs/common';
+       2  import { CachedEdgarService } from '../edgar/cached-edgar.servi
+          ce.js';
+       3  import { EdgarRecentFilings } from '../edgar/edgar.types.js';
+       4 +import type { Page } from '../common/pagination.js';           
+       5  import { Company } from './company.js';
+       5 -import { Filing, FilingFilters } from './filing.js';           
+       6 +import {                                                       
+       7 +  decodeFilingCursor,                                          
+       8 +  encodeFilingCursor,                                          
+       9 +  type FilingPosition,                                         
+      10 +} from './filing-cursor.js';                                   
+      11 +import {                                                       
+      12 +  DEFAULT_PAGE_LIMIT,                                          
+      13 +  Filing,                                                      
+      14 +  FilingFilters,                                               
+      15 +  PageRequest,                                                 
+      16 +} from './filing.js';                                          
+      17  import { TickerCikService } from './ticker-cik.service.js';
+      18  
+      19  const ARCHIVES_BASE_URL = 'https://www.sec.gov/Archives/edgar/d
+          ata';
+
+● Update(src\companies\companies.service.ts)
+  ⎿  Added 29 lines, removed 18 lines
+      30    }
+      31  
+      32    /**
+      33 -   * Lists the company's recent filings, newest first. Form typ
+         -es match                                                       
+      34 -   * exactly (case-insensitive), so amendments such as `10-K/A`
+         - are only                                                      
+      33 +   * Lists one page of the company's recent filings, newest fir
+         +st. Form types                                                 
+      34 +   * match exactly (case-insensitive), so amendments such as `1
+         +0-K/A` are only                                                
+      35     * included when requested explicitly. The date range applies
+           to the report
+      36     * date and its bounds are inclusive.
+      37 +   *                                                           
+      38 +   * Pages continue after the cursor's position rather than at 
+         +an offset, so                                                  
+      39 +   * filings that arrive between requests do not shift or repea
+         +t results.                                                     
+      40     */
+      38 -  async listFilings(ticker: string, filters: FilingFilters): Pr
+         -omise<Filing[]> {                                              
+      39 -    const filings = await this.getRecentFilings(ticker);       
+      40 -    const formTypes = filters.formTypes?.map((type) => type.toU
+         -pperCase());                                                   
+      41 -    const { startDate, endDate } = filters;                    
+      41 +  async listFilings(                                           
+      42 +    ticker: string,                                            
+      43 +    filters: FilingFilters,                                    
+      44 +    page: PageRequest = { limit: DEFAULT_PAGE_LIMIT },         
+      45 +  ): Promise<Page<Filing>> {                                   
+      46 +    // Decode first so a bad cursor fails before any upstream r
+         +equest.                                                        
+      47 +    const after = page.cursor && decodeFilingCursor(page.cursor
+         +, filters);                                                    
+      48 +    const filings = filterFilings(await this.getRecentFilings(t
+         +icker), filters);                                              
+      49  
+      43 -    return filings                                             
+      44 -      .filter(                                                 
+      45 -        (filing) =>                                            
+      46 -          !formTypes?.length ||                                
+      47 -          formTypes.includes(filing.formType.toUpperCase()),   
+      48 -      )                                                        
+      49 -      .filter((filing) => isInDateRange(filing.reportDate, star
+         -tDate, endDate))                                               
+      50 -      .sort(                                                   
+      51 -        (a, b) =>                                              
+      52 -          b.filingDate.localeCompare(a.filingDate) ||          
+      53 -          b.accessionNumber.localeCompare(a.accessionNumber),  
+      54 -      );                                                       
+      50 +    const start = after                                        
+      51 +      ? filings.findIndex((filing) => newestFirst(filing, after
+         +) > 0)                                                         
+      52 +      : 0;                                                     
+      53 +    const remaining = start === -1 ? [] : filings.slice(start);
+      54 +    const items = remaining.slice(0, page.limit);              
+      55 +    const last = items.at(-1);                                 
+      56 +                                                               
+      57 +    return {                                                   
+      58 +      items,                                                   
+      59 +      limit: page.limit,                                       
+      60 +      total: filings.length,                                   
+      61 +      nextCursor:                                              
+      62 +        last && remaining.length > items.length                
+      63 +          ? encodeFilingCursor(last, filters)                  
+      64 +          : null,                                              
+      65 +    };                                                         
+      66    }
+      67  
+      68    /**
+
+● Update(src\companies\companies.service.ts)
+  ⎿  Added 21 lines
+       86    }
+       87  }
+       88  
+       89 +function filterFilings(filings: Filing[], filters: FilingFilte
+          +rs): Filing[] {                                               
+       90 +  const formTypes = filters.formTypes?.map((type) => type.toUp
+          +perCase());                                                   
+       91 +  const { startDate, endDate } = filters;                     
+       92 +                                                              
+       93 +  return filings                                              
+       94 +    .filter(                                                  
+       95 +      (filing) =>                                             
+       96 +        !formTypes?.length || formTypes.includes(filing.formTy
+          +pe.toUpperCase()),                                            
+       97 +    )                                                         
+       98 +    .filter((filing) => isInDateRange(filing.reportDate, start
+          +Date, endDate))                                               
+       99 +    .sort(newestFirst);                                       
+      100 +}                                                             
+      101 +                                                              
+      102 +/** Sort order of the filings list: filing date, then accessio
+          +n number, descending. */                                      
+      103 +function newestFirst(a: FilingPosition, b: FilingPosition): nu
+          +mber {                                                        
+      104 +  return (                                                    
+      105 +    b.filingDate.localeCompare(a.filingDate) ||               
+      106 +    b.accessionNumber.localeCompare(a.accessionNumber)        
+      107 +  );                                                          
+      108 +}                                                             
+      109 +                                                              
+      110  // Dates are ISO `YYYY-MM-DD`, so string comparison orders the
+           m correctly.
+      111  // Filings without a report date never match a date range.
+      112  function isInDateRange(
+
+● Update(src\companies\companies.schemas.ts)
+  ⎿  Added 1 line
+      1  import { z } from 'zod';
+      2 +import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT } from './filing.js'
+        +;                                                               
+      3  
+      4  const ACCESSION_NUMBER = /^(\d{10})-?(\d{2})-?(\d{6})$/;
+      5  
+
+● Update(src\companies\companies.schemas.ts)
+  ⎿  Added 7 lines
+      37      'form-type': formTypes.optional(),
+      38      'start-date': isoDate('start-date').optional(),
+      39      'end-date': isoDate('end-date').optional(),
+      40 +    limit: z                                                   
+      41 +      .string()                                                
+      42 +      .regex(/^\d+$/, LIMIT_MESSAGE)                           
+      43 +      .transform(Number)                                       
+      44 +      .refine((n) => n >= 1 && n <= MAX_PAGE_LIMIT, LIMIT_MESSA
+         +GE)                                                            
+      45 +      .default(DEFAULT_PAGE_LIMIT),                            
+      46 +    cursor: z.string().min(1, 'cursor must not be empty').optio
+         +nal(),                                                         
+      47    })
+      48    .refine(
+      49      (query) =>
+
+● Update(src\companies\companies.schemas.ts)
+  ⎿  Added 6 lines, removed 3 lines
+      53      { message: 'start-date must not be after end-date' },
+      54    )
+      55    .transform((query) => ({
+      56 -    formTypes: query['form-type'],                             
+      57 -    startDate: query['start-date'],                            
+      58 -    endDate: query['end-date'],                                
+      56 +    filters: {                                                 
+      57 +      formTypes: query['form-type'],                           
+      58 +      startDate: query['start-date'],                          
+      59 +      endDate: query['end-date'],                              
+      60 +    },                                                         
+      61 +    page: { limit: query.limit, cursor: query.cursor },        
+      62    }));
+      63  
+      64  /** Accepts dashed or undashed accession numbers and normalizes
+           to dashed. */
+
+● Update(src\companies\companies.schemas.ts)
+  ⎿  Added 1 line
+      2  import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT } from './filing.js'
+         ;
+      3  
+      4  const ACCESSION_NUMBER = /^(\d{10})-?(\d{2})-?(\d{6})$/;
+      5 +const LIMIT_MESSAGE = `limit must be an integer between 1 and ${
+        +MAX_PAGE_LIMIT}`;                                               
+      6  
+      7  /** A real calendar date in strict ISO `YYYY-MM-DD` form. */
+      8  const isoDate = (name: string) =>
+
+● Write(src\companies\companies.controller.ts)
+  ⎿  Added 15 lines, removed 6 lines
+       1 -import { Controller, Get, Param, Query } from '@nestjs/common';
+       1 +import { Controller, Get, Param, Query, Req } from '@nestjs/com
+         +mon';                                                          
+       2 +import type { Request } from 'express';                        
+       3 +import { type Paginated, toPaginated } from '../common/paginati
+         +on.js';                                                        
+       4  import { CompaniesService } from './companies.service.js';
+       5  import {
+       6    accessionNumberSchema,
+       7    filingsQuerySchema,
+       8  } from './companies.schemas.js';
+       9  import type { Company } from './company.js';
+       8 -import type { Filing, FilingFilters } from './filing.js';      
+      10 +import type { Filing, FilingFilters, PageRequest } from './fili
+         +ng.js';                                                        
+      11  
+      12  @Controller('companies')
+      13  export class CompaniesController {
+     ...
+      19    }
+      20  
+      21    @Get(':ticker/filings')
+      20 -  listFilings(                                                 
+      22 +  async listFilings(                                           
+      23      @Param('ticker') ticker: string,
+      22 -    @Query({ schema: filingsQuerySchema }) filters: FilingFilte
+         -rs,                                                            
+      23 -  ): Promise<Filing[]> {                                       
+      24 -    return this.companiesService.listFilings(ticker, filters); 
+      24 +    @Query({ schema: filingsQuerySchema })                     
+      25 +    query: { filters: FilingFilters; page: PageRequest },      
+      26 +    @Req() request: Request,                                   
+      27 +  ): Promise<Paginated<Filing>> {                              
+      28 +    const page = await this.companiesService.listFilings(      
+      29 +      ticker,                                                  
+      30 +      query.filters,                                           
+      31 +      query.page,                                              
+      32 +    );                                                         
+      33 +    return toPaginated(page, request.originalUrl);             
+      34    }
+      35  
+      36    @Get(':ticker/filings/:accessionNumber')
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Source compiles; updating the existing specs to the new shapes.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Bash(sed -i "s/await service\.listFilings(/await listItems(/"
+      src/companies/companies.service.spec.ts && sed -i "s#  const accessions =
+      (filings: { accessionNumber:…)
+  ⎿  5:import type { FilingFilters } from './filing.js';
+     57:  const listItems = async (ticker: string, filters: FilingFilters)
+     =>
+     … +9 lines (ctrl+o to expand)
+  ⎿  Updated src\companies\companies.service.spec.ts (+15 -10)
+      2  import type { CachedEdgarService } from '../edgar/cached-edgar.s
+         ervice.js';
+      3  import type { EdgarRecentFilings } from '../edgar/edgar.types.js
+         ';
+      4  import { CompaniesService } from './companies.service.js';
+      5 +import type { FilingFilters } from './filing.js';               
+      6  import type { TickerCikService } from './ticker-cik.service.js';
+      7  
+      8  const apple = { cik: 320193, ticker: 'AAPL', name: 'Apple Inc.' 
+         };
+     ...
+      53      );
+      54    });
+      55  
+      56 +  // Filtering and ordering tests look at the items of a single
+         + page.                                                         
+      57 +  const listItems = async (ticker: string, filters: FilingFilte
+         +rs) =>                                                         
+      58 +    (await service.listFilings(ticker, filters)).items;        
+      59 +                                                               
+      60    const accessions = (filings: { accessionNumber: string }[]) =
+          >
+      61      filings.map((f) => f.accessionNumber.slice(-1));
+      62  
+     ...
+      70  
+      71    describe('listFilings', () => {
+      72      it('maps filings and fetches submissions by CIK', async () 
+          => {
+      68 -      const filings = await service.listFilings('AAPL', {});   
+      73 +      const filings = await listItems('AAPL', {});             
+      74  
+      75        expect(getSubmissions).toHaveBeenCalledWith(320193);
+      76        expect(filings).toContainEqual({
+     ...
+       84      });
+       85  
+       86      it('turns an empty report date into null', async () => {
+       82 -      const filings = await service.listFilings('AAPL', { form
+          -Types: ['4'] });                                              
+       87 +      const filings = await listItems('AAPL', { formTypes: ['4
+          +'] });                                                        
+       88  
+       89        expect(filings[0].reportDate).toBeNull();
+       90      });
+       91  
+       92      it('orders newest first, breaking ties by accession number
+           ', async () => {
+       88 -      const filings = await service.listFilings('AAPL', {});  
+       93 +      const filings = await listItems('AAPL', {});            
+       94  
+       95        expect(accessions(filings)).toEqual(['5', '3', '2', '4',
+            '1']);
+       96      });
+     … 47 more lines (ctrl+o to expand)
+
+  Read 2 files (ctrl+o to expand)
+
+● Update(src\companies\companies.service.spec.ts)
+  ⎿  Added 141 lines
+      145      });
+      146    });
+      147  
+      148 +  describe('listFilings paging', () => {                      
+      149 +    const pageOf = (                                          
+      150 +      filters: FilingFilters,                                 
+      151 +      limit: number,                                          
+      152 +      cursor?: string,                                        
+      153 +    ) => service.listFilings('AAPL', filters, { limit, cursor 
+          +});                                                           
+      154 +                                                              
+      155 +    const allPages = async (filters: FilingFilters, limit: num
+          +ber) => {                                                     
+      156 +      const pages = [await pageOf(filters, limit)];           
+      157 +      while (pages.at(-1)!.nextCursor) {                      
+      158 +        pages.push(await pageOf(filters, limit, pages.at(-1)!.
+          +nextCursor!));                                                
+      159 +      }                                                       
+      160 +      return pages;                                           
+      161 +    };                                                        
+      162 +                                                              
+      163 +    it('returns the first page with the total and a cursor for
+          + the next', async () => {                                     
+      164 +      const page = await pageOf({}, 2);                       
+      165 +                                                              
+      166 +      expect(accessions(page.items)).toEqual(['5', '3']);     
+      167 +      expect(page).toMatchObject({ limit: 2, total: 5 });     
+      168 +      expect(page.nextCursor).toEqual(expect.any(String));    
+      169 +    });                                                       
+      170 +                                                              
+      171 +    it('walks every filing exactly once, ending with a null cu
+          +rsor', async () => {                                          
+      172 +      const pages = await allPages({}, 2);                    
+      173 +                                                              
+      174 +      expect(pages.map((page) => accessions(page.items))).toEq
+          +ual([                                                         
+      175 +        ['5', '3'],                                           
+      176 +        ['2', '4'],                                           
+      177 +        ['1'],                                                
+      178 +      ]);                                                     
+      179 +      expect(pages.at(-1)!.nextCursor).toBeNull();            
+      180 +    });                                                       
+      181 +                                                              
+      182 +    it('counts and pages only the filings that match the filte
+          +rs', async () => {                                            
+      183 +      const pages = await allPages({ formTypes: ['10-K', '10-K
+          +/A'] }, 1);                                                   
+      184 +                                                              
+      185 +      expect(pages.map((page) => page.total)).toEqual([2, 2]);
+      186 +      expect(pages.flatMap((page) => accessions(page.items))).
+          +toEqual([                                                     
+      187 +        '4',                                                  
+      188 +        '1',                                                  
+      189 +      ]);                                                     
+      190 +    });                                                       
+      191 +                                                              
+      192 +    it('has no next cursor when everything fits on one page', 
+          +async () => {                                                 
+      193 +      await expect(pageOf({}, 5)).resolves.toMatchObject({    
+      194 +        total: 5,                                             
+      195 +        nextCursor: null,                                     
+      196 +      });                                                     
+      197 +    });                                                       
+      198 +                                                              
+      199 +    it('returns an empty page when nothing matches', async () 
+          +=> {                                                          
+      200 +      await expect(pageOf({ formTypes: ['S-1'] }, 2)).resolves
+          +.toEqual({                                                    
+      201 +        items: [],                                            
+      202 +        limit: 2,                                             
+      203 +        total: 0,                                             
+      204 +        nextCursor: null,                                     
+      205 +      });                                                     
+      206 +    });                                                       
+      207 +                                                              
+      208 +    it('neither repeats nor skips filings when new ones arrive
+          + between pages', async () => {                                
+      209 +      const first = await pageOf({}, 2);                      
+      210 +      getSubmissions.mockResolvedValue({                      
+      211 +        filings: {                                            
+      212 +          recent: {                                           
+      213 +            accessionNumber: ['0000320193-24-000009', ...recen
+          +t.accessionNumber],                                           
+      214 +            filingDate: ['2024-05-01', ...recent.filingDate], 
+      215 +            reportDate: ['2024-04-30', ...recent.reportDate], 
+      216 +            form: ['8-K', ...recent.form],                    
+      217 +            primaryDocument: ['new.htm', ...recent.primaryDocu
+          +ment],                                                        
+      218 +          },                                                  
+      219 +        },                                                    
+      220 +      });                                                     
+      221 +                                                              
+      222 +      const second = await pageOf({}, 2, first.nextCursor!);  
+      223 +                                                              
+      224 +      expect(accessions(second.items)).toEqual(['2', '4']);   
+      225 +      expect(second.total).toBe(6);                           
+      226 +    });                                                       
+      227 +                                                              
+      228 +    it('continues after the cursor position even if that filin
+          +g is gone', async () => {                                     
+      229 +      const first = await pageOf({}, 2);                      
+      230 +      getSubmissions.mockResolvedValue({                      
+      231 +        filings: {                                            
+      232 +          recent: {                                           
+      233 +            accessionNumber: recent.accessionNumber.slice(0, 1
+          +),                                                            
+      234 +            filingDate: recent.filingDate.slice(0, 1),        
+      235 +            reportDate: recent.reportDate.slice(0, 1),        
+      236 +            form: recent.form.slice(0, 1),                    
+      237 +            primaryDocument: recent.primaryDocument.slice(0, 1
+          +),                                                            
+      238 +          },                                                  
+      239 +        },                                                    
+      240 +      });                                                     
+      241 +                                                              
+      242 +      const second = await pageOf({}, 2, first.nextCursor!);  
+      243 +                                                              
+      244 +      expect(accessions(second.items)).toEqual(['1']);        
+      245 +    });                                                       
+      246 +                                                              
+      247 +    it('accepts a cursor with equivalent filters in another ca
+          +se or order', async () => {                                   
+      248 +      const first = await pageOf({ formTypes: ['10-K', '10-q']
+          + }, 1);                                                       
+      249 +                                                              
+      250 +      const second = await pageOf(                            
+      251 +        { formTypes: ['10-Q', '10-k'] },                      
+      252 +        1,                                                    
+      253 +        first.nextCursor!,                                    
+      254 +      );                                                      
+      255 +                                                              
+      256 +      expect(accessions(second.items)).toEqual(['1']);        
+      257 +    });                                                       
+      258 +                                                              
+      259 +    it.each<[string, FilingFilters]>([                        
+      260 +      ['form types', { formTypes: ['8-K'] }],                 
+      261 +      ['start date', { startDate: '2020-01-01' }],            
+      262 +      ['end date', { endDate: '2030-01-01' }],                
+      263 +    ])(                                                       
+      264 +      'rejects a cursor when the %s changed, explaining why', 
+      265 +      async (_, changed) => {                                 
+      266 +        const first = await pageOf({}, 2);                    
+      267 +                                                              
+      268 +        const result = pageOf(changed, 2, first.nextCursor!); 
+      269 +                                                              
+      270 +        await expect(result).rejects.toBeInstanceOf(BadRequest
+          +Exception);                                                   
+      271 +        await expect(result).rejects.toThrow(                 
+      272 +          /cursor does not match the current filters/,        
+      273 +        );                                                    
+      274 +      },                                                      
+      275 +    );                                                        
+      276 +                                                              
+      277 +    it.each(['not-a-cursor', 'e30', Buffer.from('{"x":1}').toS
+          +tring('base64url')])(                                         
+      278 +      'rejects malformed cursor %s without calling SEC',      
+      279 +      async (cursor) => {                                     
+      280 +        const result = pageOf({}, 2, cursor);                 
+      281 +                                                              
+      282 +        await expect(result).rejects.toBeInstanceOf(BadRequest
+          +Exception);                                                   
+      283 +        await expect(result).rejects.toThrow(/cursor is invali
+          +d/);                                                          
+      284 +        expect(getSubmissions).not.toHaveBeenCalled();        
+      285 +      },                                                      
+      286 +    );                                                        
+      287 +  });                                                         
+      288 +                                                              
+      289    describe('getFiling', () => {
+      290      it('returns the matching filing', async () => {
+      291        await expect(
+
+● Bash(sed -i "s/^import { NotFoundException } from '@nestjs\/common';/import {
+      BadRequestException, NotFoundException } from '@nestjs\/common';/"
+      src/companies/compan…)
+  ⎿  import { BadRequestException, NotFoundException } from '@nestjs/common
+     ';
+     import type { CachedEdgarService } from '../edgar/cached-edgar.service
+     … +2 lines (ctrl+o to expand)
+  ⎿  Updated src\companies\companies.service.spec.ts (+1 -1)
+      1 -import { NotFoundException } from '@nestjs/common';             
+      1 +import { BadRequestException, NotFoundException } from '@nestjs/
+        +common';                                                        
+      2  import type { CachedEdgarService } from '../edgar/cached-edgar.s
+         ervice.js';
+      3  import type { EdgarRecentFilings } from '../edgar/edgar.types.js
+         ';
+      4  import { CompaniesService } from './companies.service.js';
+● Now the schema spec.
+
+● Update(src\companies\companies.schemas.spec.ts)
+  ⎿  Added 29 lines, removed 2 lines
+       9        'form-type': ['10-K, 8-K', '', '10-K/A'],
+      10      });
+      11  
+      12 -    expect(result.formTypes).toEqual(['10-K', '8-K', '10-K/A'])
+         -;                                                              
+      12 +    expect(result.filters.formTypes).toEqual(['10-K', '8-K', '1
+         +0-K/A']);                                                      
+      13    });
+      14  
+      15    it('accepts a valid inclusive date range', () => {
+     ...
+      17        filingsQuerySchema.parse({
+      18          'start-date': '2024-01-01',
+      19          'end-date': '2024-01-01',
+      20 -      }),                                                      
+      20 +      }).filters,                                              
+      21      ).toEqual({
+      22        formTypes: undefined,
+      23        startDate: '2024-01-01',
+     ...
+      25      });
+      26    });
+      27  
+      28 +  it('defaults to a page of 50 without a cursor', () => {      
+      29 +    expect(filingsQuerySchema.parse({}).page).toEqual({        
+      30 +      limit: 50,                                               
+      31 +      cursor: undefined,                                       
+      32 +    });                                                        
+      33 +  });                                                          
+      34 +                                                               
+      35 +  it('accepts a limit between 1 and 200 and passes the cursor t
+         +hrough', () => {                                               
+      36 +    expect(filingsQuerySchema.parse({ limit: '1' }).page.limit)
+         +.toBe(1);                                                      
+      37 +    expect(                                                    
+      38 +      filingsQuerySchema.parse({ limit: '200', cursor: 'abc' })
+         +.page,                                                         
+      39 +    ).toEqual({ limit: 200, cursor: 'abc' });                  
+      40 +  });                                                          
+      41 +                                                               
+      42 +  it.each(['0', '201', '-1', '1.5', 'ten', ''])('rejects limit 
+         +%s', (limit) => {                                              
+      43 +    const result = filingsQuerySchema.safeParse({ limit });    
+      44 +                                                               
+      45 +    expect(result.success).toBe(false);                        
+      46 +    expect(result.error?.issues[0].message).toBe(              
+      47 +      'limit must be an integer between 1 and 200',            
+      48 +    );                                                         
+      49 +  });                                                          
+      50 +                                                               
+      51 +  it('rejects an empty cursor', () => {                        
+      52 +    expect(filingsQuerySchema.safeParse({ cursor: '' }).success
+         +).toBe(false);                                                 
+      53 +  });                                                          
+      54 +                                                               
+      55    it.each(['2024-1-01', '20240101', '2024-02-30', '2023-02-29',
+           '2024-13-01'])(
+      56      'rejects invalid date %s',
+      57      (date) => {
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Update(test\app.e2e-spec.ts)
+  ⎿  Added 10 lines, removed 6 lines
+      84  
+      85      expect(res.body.status).toBe(200);
+      86      expect(res.body.error).toBeNull();
+      87 -    expect(res.body.data.map((f: { formType: string }) => f.for
+         -mType)).toEqual([                                              
+      88 -      '10-Q',                                                  
+      89 -      '8-K',                                                   
+      90 -      '10-K',                                                  
+      91 -    ]);                                                        
+      92 -    expect(res.body.data[2]).toEqual({                         
+      87 +    expect(                                                    
+      88 +      res.body.data.items.map((f: { formType: string }) => f.fo
+         +rmType),                                                       
+      89 +    ).toEqual(['10-Q', '8-K', '10-K']);                        
+      90 +    expect(res.body.data.pagination).toEqual({                 
+      91 +      limit: 50,                                               
+      92 +      total: 3,                                                
+      93 +      nextCursor: null,                                        
+      94 +      next: null,                                              
+      95 +    });                                                        
+      96 +    expect(res.body.data.items[2]).toEqual({                   
+      97        accessionNumber: '0000320193-24-000001',
+      98        formType: '10-K',
+      99        filingDate: '2023-11-03',
+
+● Update(test\app.e2e-spec.ts)
+  ⎿  Added 83 lines, removed 1 line
+      109      ).expect(200);
+      110  
+      111      expect(
+      112 -      res.body.data.map((f: { accessionNumber: string }) => f.
+          -accessionNumber),                                             
+      112 +      res.body.data.items.map(                                
+      113 +        (f: { accessionNumber: string }) => f.accessionNumber,
+      114 +      ),                                                      
+      115      ).toEqual(['0000320193-24-000002']);
+      116 +    expect(res.body.data.pagination.total).toBe(1);           
+      117    });
+      118  
+      119 +  it('GET /api/companies/:ticker/filings pages through results
+          + by following next', async () => {                            
+      120 +    const seen: string[] = [];                                
+      121 +    let next: string | null =                                 
+      122 +      '/api/companies/aapl/filings?form-type=10-Q&form-type=8-
+          +K,10-K&limit=2';                                              
+      123 +    const pages: { limit: number; total: number }[] = [];     
+      124 +                                                              
+      125 +    while (next) {                                            
+      126 +      const res = await get(next).expect(200);                
+      127 +      seen.push(                                              
+      128 +        ...res.body.data.items.map(                           
+      129 +          (f: { accessionNumber: string }) => f.accessionNumbe
+          +r,                                                            
+      130 +        ),                                                    
+      131 +      );                                                      
+      132 +      pages.push(res.body.data.pagination);                   
+      133 +      next = res.body.data.pagination.next;                   
+      134 +    }                                                         
+      135 +                                                              
+      136 +    expect(seen).toEqual([                                    
+      137 +      '0000320193-24-000003',                                 
+      138 +      '0000320193-24-000002',                                 
+      139 +      '0000320193-24-000001',                                 
+      140 +    ]);                                                       
+      141 +    expect(pages).toEqual([                                   
+      142 +      expect.objectContaining({ limit: 2, total: 3 }),        
+      143 +      expect.objectContaining({ limit: 2, total: 3, nextCursor
+          +: null }),                                                    
+      144 +    ]);                                                       
+      145 +  });                                                         
+      146 +                                                              
+      147 +  it('GET /api/companies/:ticker/filings next keeps the reques
+          +t filters and limit', async () => {                           
+      148 +    const res = await get(                                    
+      149 +      '/api/companies/AAPL/filings?form-type=10-Q&form-type=8-
+          +K&limit=1',                                                   
+      150 +    ).expect(200);                                            
+      151 +                                                              
+      152 +    const next = new URL(res.body.data.pagination.next, 'http:
+          +//test');                                                     
+      153 +    expect(next.pathname).toBe('/api/companies/AAPL/filings');
+      154 +    expect(next.searchParams.getAll('form-type')).toEqual(['10
+          +-Q', '8-K']);                                                 
+      155 +    expect(next.searchParams.get('limit')).toBe('1');         
+      156 +    expect(next.searchParams.get('cursor')).toBe(             
+      157 +      res.body.data.pagination.nextCursor,                    
+      158 +    );                                                        
+      159 +  });                                                         
+      160 +                                                              
+      161 +  it('GET /api/companies/:ticker/filings returns 400 when the 
+          +cursor no longer matches the filters', async () => {          
+      162 +    const first = await get(                                  
+      163 +      '/api/companies/AAPL/filings?form-type=10-Q&limit=1',   
+      164 +    ).expect(200);                                            
+      165 +    const cursor = encodeURIComponent(first.body.data.paginati
+          +on.nextCursor);                                               
+      166 +                                                              
+      167 +    // Only 1 10-Q exists, so take the cursor from an unfilter
+          +ed listing.                                                   
+      168 +    const unfiltered = await get('/api/companies/AAPL/filings?
+          +limit=1').expect(                                             
+      169 +      200,                                                    
+      170 +    );                                                        
+      171 +    const res = await get(                                    
+      172 +      `/api/companies/AAPL/filings?form-type=8-K&limit=1&curso
+          +r=${encodeURIComponent(unfiltered.body.data.pagination.nextCur
+          +sor)}`,                                                       
+      173 +    ).expect(400);                                            
+      174 +                                                              
+      175 +    expect(cursor).toBe('null');                              
+      176 +    expect(res.body).toEqual({                                
+      177 +      data: null,                                             
+      178 +      error: {                                                
+      179 +        message: expect.stringContaining(                     
+      180 +          'cursor does not match the current filters',        
+      181 +        ),                                                    
+      182 +        status: 400,                                          
+      183 +      },                                                      
+      184 +      status: 400,                                            
+      185 +    });                                                       
+      186 +  });                                                         
+      187 +                                                              
+      188 +  it.each(['limit=0', 'limit=201', 'limit=abc', 'cursor=garbag
+          +e'])(                                                         
+      189 +    'GET /api/companies/:ticker/filings returns 400 for %s',  
+      190 +    async (query) => {                                        
+      191 +      const res = await get(`/api/companies/AAPL/filings?${que
+          +ry}`).expect(400);                                            
+      192 +                                                              
+      193 +      expect(res.body.data).toBeNull();                       
+      194 +      expect(res.body.error.status).toBe(400);                
+      195 +    },                                                        
+      196 +  );                                                          
+      197 +                                                              
+      198    it('GET /api/companies/:ticker/filings returns 400 for an in
+           valid date', async () => {
+      199      const res = await get(
+      200        '/api/companies/AAPL/filings?start-date=2024-02-30',
+
+● Update(test\app.e2e-spec.ts)
+  ⎿  Added 2 lines, removed 9 lines
+      159    });
+      160  
+      161    it('GET /api/companies/:ticker/filings returns 400 when the 
+           cursor no longer matches the filters', async () => {
+      162 -    const first = await get(                                  
+      163 -      '/api/companies/AAPL/filings?form-type=10-Q&limit=1',   
+      164 -    ).expect(200);                                            
+      162 +    const first = await get('/api/companies/AAPL/filings?limit
+          +=1').expect(200);                                             
+      163      const cursor = encodeURIComponent(first.body.data.paginati
+           on.nextCursor);
+      164  
+      167 -    // Only 1 10-Q exists, so take the cursor from an unfilter
+          -ed listing.                                                   
+      168 -    const unfiltered = await get('/api/companies/AAPL/filings?
+          -limit=1').expect(                                             
+      169 -      200,                                                    
+      170 -    );                                                        
+      165      const res = await get(
+      172 -      `/api/companies/AAPL/filings?form-type=8-K&limit=1&curso
+          -r=${encodeURIComponent(unfiltered.body.data.pagination.nextCur
+          -sor)}`,                                                       
+      166 +      `/api/companies/AAPL/filings?form-type=8-K&limit=1&curso
+          +r=${cursor}`,                                                 
+      167      ).expect(400);
+      168  
+      175 -    expect(cursor).toBe('null');                              
+      169      expect(res.body).toEqual({
+      170        data: null,
+      171        error: {
+
+● Update(test\app.e2e-spec.ts)
+  ⎿  Added 8 lines, removed 1 line
+      244        200,
+      245      );
+      246  
+      247 -    expect(res.body).toEqual({ data: [], error: null, status: 
+          -200 });                                                       
+      247 +    expect(res.body).toEqual({                                
+      248 +      data: {                                                 
+      249 +        items: [],                                            
+      250 +        pagination: { limit: 50, total: 0, nextCursor: null, n
+          +ext: null },                                                  
+      251 +      },                                                      
+      252 +      error: null,                                            
+      253 +      status: 200,                                            
+      254 +    });                                                       
+      255    });
+      256  
+      257    it.each(['form-type=', 'form-type=,', 'form-type=%20,%20'])(
+
+● Update(test\app.e2e-spec.ts)
+  ⎿  Added 1 line, removed 1 line
+      259      async (query) => {
+      260        const res = await get(`/api/companies/AAPL/filings?${que
+           ry}`).expect(200);
+      261  
+      262 -      expect(res.body.data).toHaveLength(3);                  
+      262 +      expect(res.body.data.items).toHaveLength(3);            
+      263      },
+      264    );
+      265  
+
+● Bash(npx prettier --write "src/**/*.ts" "test/**/*.ts" >/dev/null; rtk proxy
+      npx tsc --noEmit -p tsconfig.json; echo "tsc $?"; rtk proxy npx vitest run
+      2>&1 | grep -…)
+  ⎿  npm notice run edgar-api@0.0.1 npx
+     npm notice run ^"tsc^" --noEmit -p tsconfig.json
+     test/app.e2e-spec.ts(126,13): error TS7022: 'res' implicitly has type
+     … +10 lines (ctrl+o to expand)
+  ⎿  Updated src\common\pagination.ts (+4 -1)
+      25   * cursor replaced, so clients keep their filters and limit wit
+          hout rebuilding
+      26   * the URL.
+      27   */
+      28 -export function toPaginated<T>(page: Page<T>, requestUrl: strin
+         -g): Paginated<T> {                                             
+      28 +export function toPaginated<T>(                                
+      29 +  page: Page<T>,                                               
+      30 +  requestUrl: string,                                          
+      31 +): Paginated<T> {                                              
+      32    return {
+      33      items: page.items,
+      34      pagination: {
+  ⎿  Updated src\common\response-envelope.interceptor.ts (+3 -4)
+      12   * Wraps successful handler results in the API response envelop
+          e.
+      13   */
+      14  @Injectable()
+      15 -export class ResponseEnvelopeInterceptor<T> implements NestInte
+         -rceptor<                                                       
+      16 -  T,                                                           
+      17 -  ApiResponse<T>                                               
+      18 -> {                                                            
+      15 +export class ResponseEnvelopeInterceptor<T>                    
+      16 +  implements NestInterceptor<T, ApiResponse<T>>                
+      17 +{                                                              
+      18    intercept(
+      19      context: ExecutionContext,
+      20      next: CallHandler<T>,
+  ⎿  Updated src\companies\companies.service.spec.ts (+16 -15)
+      146    });
+      147  
+      148    describe('listFilings paging', () => {
+      149 -    const pageOf = (                                          
+      150 -      filters: FilingFilters,                                 
+      151 -      limit: number,                                          
+      152 -      cursor?: string,                                        
+      153 -    ) => service.listFilings('AAPL', filters, { limit, cursor 
+          -});                                                           
+      149 +    const pageOf = (filters: FilingFilters, limit: number, cur
+          +sor?: string) =>                                              
+      150 +      service.listFilings('AAPL', filters, { limit, cursor });
+      151  
+      152      const allPages = async (filters: FilingFilters, limit: num
+           ber) => {
+      153        const pages = [await pageOf(filters, limit)];
+     ...
+      207        getSubmissions.mockResolvedValue({
+      208          filings: {
+      209            recent: {
+      213 -            accessionNumber: ['0000320193-24-000009', ...recen
+          -t.accessionNumber],                                           
+      210 +            accessionNumber: [                                
+      211 +              '0000320193-24-000009',                         
+      212 +              ...recent.accessionNumber,                      
+      213 +            ],                                                
+      214              filingDate: ['2024-05-01', ...recent.filingDate],
+      215              reportDate: ['2024-04-30', ...recent.reportDate],
+      216              form: ['8-K', ...recent.form],
+     ...
+      274        },
+      275      );
+      276  
+      277 -    it.each(['not-a-cursor', 'e30', Buffer.from('{"x":1}').toS
+          -tring('base64url')])(                                         
+      278 -      'rejects malformed cursor %s without calling SEC',      
+      279 -      async (cursor) => {                                     
+      280 -        const result = pageOf({}, 2, cursor);                 
+      277 +    it.each([                                                 
+      278 +      'not-a-cursor',                                         
+      279 +      'e30',                                                  
+      280 +      Buffer.from('{"x":1}').toString('base64url'),           
+      281 +    ])('rejects malformed cursor %s without calling SEC', asyn
+          +c (cursor) => {                                               
+      282 +      const result = pageOf({}, 2, cursor);                   
+      283  
+      282 -        await expect(result).rejects.toBeInstanceOf(BadRequest
+          -Exception);                                                   
+      283 -        await expect(result).rejects.toThrow(/cursor is invali
+          -d/);                                                          
+     … 10 more lines (ctrl+o to expand)
+  ⎿  (timeout 5m)
+
+● Bash(sed -i '126s/const res = await get(next)/const res: request.Response =
+      await get(next)/' test/app.e2e-spec.ts && sed -n 126p test/app.e2e-spec.ts
+      && rtk proxy n…)
+  ⎿        const res: request.Response = await get(next).expect(200);
+     npm notice run edgar-api@0.0.1 npx
+     npm notice run ^"tsc^" --noEmit -p tsconfig.json
+     … +8 lines (ctrl+o to expand)
+  ⎿  Updated test\app.e2e-spec.ts (+1 -1)
+      123      const pages: { limit: number; total: number }[] = [];
+      124  
+      125      while (next) {
+      126 -      const res = await get(next).expect(200);                
+      126 +      const res: request.Response = await get(next).expect(200
+          +);                                                            
+      127        seen.push(
+      128          ...res.body.data.items.map(
+      129            (f: { accessionNumber: string }) => f.accessionNumbe
+           r,
+  ⎿  (timeout 5m)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Bash(git checkout src/common/response-envelope.interceptor.ts &&
+      ./node_modules/.bin/prettier --version && ./node_modules/.bin/prettier
+      --check "src/**/*.ts" "test/*…)
+  ⎿  ok updated 1 path from the index
+     3.10.1
+     Checking formatting...
+     All matched files use Prettier code style!
+  ⎿  Updated src\common\response-envelope.interceptor.ts (+4 -3)
+  ⎿  (a git step in this command can move the working tree, so these may be
+     its changes, not edits) (ctrl+o to expand)
+
+● Paging code and tests are done and pass. Now running a live check against SEC.
+
+  Ran 4 shell commands (ctrl+o to expand)
+
+● Background command "Start built API on port 3919" failed with exit code 127
+
+● Cursor paging is working on the filings list, including against live SEC data.
+  Nothing is committed yet.
+
+  Response shape. The top-level wrapper is unchanged:
+  {
+    "data": {
+      "items": [ ... ],
+      "pagination": {
+        "limit": 2,
+        "total": 12,
+        "nextCursor": "eyJmaWxpbmdEYXRl...",
+        "next": "/api/companies/aapl/filings?form-type=10-K&limit=2&cursor=eyJma
+  WxpbmdEYXRl..."
+      }
+    },
+    "error": null,
+    "status": 200
+  }
+  - total counts every filing that matches the filters, across all pages.
+  - nextCursor and next are both null on the last page.
+  - next is a relative URL. It repeats the original request exactly, including
+    repeated form-type params and limit, with only the cursor replaced.
+
+  Rules
+  - limit defaults to 50 and must be an integer from 1 to 200.
+  - Rejected cursors get a 400 that says why:
+    - A changed filter: "cursor does not match the current filters (form-type,
+      start-date, end-date); repeat the filters used for the first page, or
+      start again without a cursor".
+    - A malformed cursor: "cursor is invalid; pass the nextCursor value from a
+      previous response unchanged". It is rejected before any SEC request.
+  - The same filters written differently, such as 10-k,10-Q vs 10-Q,10-K, are
+    accepted.
+  - limit can change between pages, since it isn't a filter.
+  - The cursor stores the last filing returned and the filters that produced it.
+    A page continues after that position, so filings that arrive between
+    requests cause no duplicates or gaps. This still works if the cursor's
+    filing has disappeared.
+
+  Files
+  - New: src/common/pagination.ts, the shared page types plus toPaginated(),
+    which builds the pagination section and the next URL.
+  - New: src/companies/filing-cursor.ts, which creates and checks cursors.
+  - Changed:
+    - CompaniesService.listFilings: now returns one page.
+    - src/companies/companies.schemas.ts: validates limit and cursor.
+    - src/companies/companies.controller.ts: adds the pagination section.
+
+  Checks
+  - Type check, lint, prettier (the project's own version) and build are clean.
+  - 93 unit tests pass (was 70). The new ones cover:
+    - Walking all pages exactly once.
+    - Paging and totals with filters applied.
+    - No duplicates or gaps when a new filing arrives between pages.
+    - A cursor whose filing has disappeared.
+    - Equivalent filters accepted, and each kind of changed filter rejected.
+    - Malformed cursors never reaching SEC.
+    - Limit bounds.
+  - 31 e2e tests pass (was 24). The new ones cover:
+    - Following next until it's null.
+    - next keeping the original filters and limit.
+    - A cursor reused with different filters gets a 400.
+    - Bad limit and cursor values.
+  - Live against SEC: following next through Apple's 10-K and 10-Q filings at
+    limit=10 returned 5 pages and 45 unique filings, with no duplicates. Each
+    rejection case also returned the expected 400 and message.
+  - I stopped the test server afterwards, which is why its background task shows
+    as "failed".
+
+  Things to know
+  - The cursor is opaque by agreement, not hidden. It's base64-encoded JSON, so
+    anyone can decode it. That's harmless because it contains no secrets. If
+    you'd rather clients couldn't read it or depend on its contents, it can be
+    signed or encrypted later.
+  - Prettier version mismatch. Running npx prettier through the RTK hook used a
+    different Prettier version and reformatted response-envelope.interceptor.ts
+    in a way the project's Prettier 3.10.1 rejects. I reverted that file, and
+    everything passes with the project's own version.
+
+  Should I commit this on master?
+
+✻ Crunched for 4m 23s · done 17:20
+
+❯ Great, commit it                                                              
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I committed the paging work on master as 34dfd85, "Add cursor-based paging to
+  the filings list". It includes all 9 changed files, and nothing has been
+  pushed.
+
+  master now has three commits on top of the initial one:
+  - 45b6e60 the API
+  - e19f04a the cache
+  - 34dfd85 paging
+
+✻ Churned for 7s · done 17:21
+
+❯ Verify the code against the given spec:                                       
+  ● Look up a company by ticker                                                 
+  ● List a company's filings, newest first, filtered by form type (for example  
+  10-K or 8-K)                                                                  
+  and date range, with pagination. Each filing should include the form type,    
+  filing date,                                                                  
+  report date, accession number and a link to the primary document on sec.gov   
+  ● Fetch a single filing by its accession number                               
+  Report mismatches to me and let me chose what to do.                          
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Company lookup and the filing fields fully match the spec. I found three real
+  mismatches plus one minor edge case, and one of them is serious: for some
+  companies we return less than a year of history.
+
+  What matches
+
+  - Look up a company by ticker: GET /api/companies/:ticker returns CIK, ticker
+    and name, and ignores case.
+  - List filings:
+    - Sorted newest first.
+    - Filtered by form type, and by date range on the report date (see item 2).
+    - Paginated.
+  - Filing fields: all five are present (form type, filing date, report date,
+    accession number, document link). A generated link
+    (.../320193/000032019325000079/aapl-20250927.htm) loads with a 200 from
+    sec.gov.
+
+  Mismatches
+
+  1. Only "recent" filings are reachable (serious). The spec says "a company's
+  filings", but we only read SEC's recent block, which you chose to limit to
+  earlier. I measured live how much that leaves out:
+
+  ┌──────────┬───────────────────┬─────────────────┬────────────────────────┐
+  │ Company  │ Filings we return │ Reaches back to │ Filings we can't reach │
+  ├──────────┼───────────────────┼─────────────────┼────────────────────────┤
+  │ Apple    │ 1,002             │ 2015-10         │ 1,278                  │
+  ├──────────┼───────────────────┼─────────────────┼────────────────────────┤
+  │ IBM      │ 1,001             │ 2020-02         │ 6,685                  │
+  ├──────────┼───────────────────┼─────────────────┼────────────────────────┤
+  │ JPMorgan │ 26,490            │ 2025-11         │ 144,751                │
+  └──────────┴───────────────────┴─────────────────┴────────────────────────┘
+
+  JPMorgan files huge numbers of 424B2 prospectuses (23,034 in its recent
+  block), so its recent block covers only about one year. ?form-type=10-K
+  returns a single 10-K. The single-filing lookup also returns a 404 for any
+  older accession number, even though the filing exists.
+
+  Options:
+  - a) Also read SEC's older filing files (filings.files), and fetch them only
+    when a query or page needs them. The cursor design already supports this. It
+    costs more SEC requests and memory for big filers.
+  - b) Keep the limit and document it in the API, e.g. with a field saying
+    results are limited to recent filings.
+
+  2. Date filter vs sort order.
+  - The spec's "date range" doesn't say which date. You chose the report date,
+    but the list is sorted by filing date, so a range doesn't line up with the
+    order clients see.
+  - Filings without a report date are dropped whenever a date filter is used.
+    For JPMorgan that's 26,321 of 26,490 recent filings; for Apple, 225 of
+    1,002.
+
+  Options:
+  - a) Keep it as is.
+  - b) Switch the filter to the filing date.
+  - c) Support both, with separate filing-date and report-date parameters.
+
+  3. Single filing lookup needs the ticker. The spec says "fetch a single filing
+  by its accession number". Our route is
+  /companies/:ticker/filings/:accessionNumber, which you chose earlier. A caller
+  who has only an accession number can't use it.
+
+  Options:
+  - a) Keep it.
+  - b) Add GET /api/filings/:accessionNumber. This needs our own index from
+    accession number to CIK, because the accession number's prefix is often a
+    filing agent's ID rather than the company's.
+
+  4. Minor edge case: a filing with an empty primaryDocument would get a link 
+  ending in /. That's a folder, not a document. I found none in the three
+  companies above.
+
+  Options:
+  - a) Return null for the link in that case.
+  - b) Leave it.
+
+  Which option do you want for each?
+
+✻ Brewed for 40s · done 17:23
+
+❯ 1b, 2b and document the switch, 3a, 4b                                        
+
+  Searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● Update(src\companies\companies.service.ts)
+  ⎿  Added 5 lines, removed 2 lines
+      32    /**
+      33     * Lists one page of the company's recent filings, newest fir
+          st. Form types
+      34     * match exactly (case-insensitive), so amendments such as `1
+          0-K/A` are only
+      35 -   * included when requested explicitly. The date range applies
+         - to the report                                                 
+      36 -   * date and its bounds are inclusive.                        
+      35 +   * included when requested explicitly. The date range applies
+         + to the filing                                                 
+      36 +   * date, the same date the list is sorted by, and its bounds 
+         +are inclusive.                                                 
+      37     *
+      38 +   * Only SEC's "recent" block is read: the latest 1,000 filing
+         +s or the last                                                  
+      39 +   * year, whichever is more. Older filings are not returned.  
+      40 +   *                                                           
+      41     * Pages continue after the cursor's position rather than at 
+          an offset, so
+      42     * filings that arrive between requests do not shift or repea
+          t results.
+      43     */
+
+● Update(src\companies\companies.service.ts)
+  ⎿  Added 5 lines, removed 1 line
+       98        (filing) =>
+       99          !formTypes?.length || formTypes.includes(filing.formTy
+           pe.toUpperCase()),
+      100      )
+      101 -    .filter((filing) => isInDateRange(filing.reportDate, start
+          -Date, endDate))                                               
+      101 +    .filter(                                                  
+      102 +      (filing) =>                                             
+      103 +        (startDate === undefined || filing.filingDate >= start
+          +Date) &&                                                      
+      104 +        (endDate === undefined || filing.filingDate <= endDate
+          +),                                                            
+      105 +    )                                                         
+      106      .sort(newestFirst);
+      107  }
+      108  
+● Update(src\companies\companies.service.ts)
+  ⎿  Removed 17 lines
+      114    );
+      115  }
+      116  
+      117 -// Dates are ISO `YYYY-MM-DD`, so string comparison orders the
+          -m correctly.                                                  
+      118 -// Filings without a report date never match a date range.    
+      119 -function isInDateRange(                                       
+      120 -  reportDate: string | null,                                  
+      121 -  startDate?: string,                                         
+      122 -  endDate?: string,                                           
+      123 -): boolean {                                                  
+      124 -  if (startDate === undefined && endDate === undefined) {     
+      125 -    return true;                                              
+      126 -  }                                                           
+      127 -  return (                                                    
+      128 -    reportDate !== null &&                                    
+      129 -    (startDate === undefined || reportDate >= startDate) &&   
+      130 -    (endDate === undefined || reportDate <= endDate)          
+      131 -  );                                                          
+      132 -}                                                             
+      133 -                                                              
+      117  function toFilings(cik: number, recent: EdgarRecentFilings): F
+           iling[] {
+      118    return recent.accessionNumber.map((accessionNumber, i) => ({
+      119      accessionNumber,
+
+● Update(src\companies\companies.service.ts)
+  ⎿  Added 1 line
+      93    const formTypes = filters.formTypes?.map((type) => type.toUpp
+          erCase());
+      94    const { startDate, endDate } = filters;
+      95  
+      96 +  // Dates are ISO `YYYY-MM-DD`, so string comparison orders th
+         +em correctly.                                                  
+      97    return filings
+      98      .filter(
+      99        (filing) =>
+
+● Update(src\companies\companies.service.spec.ts)
+  ⎿  Added 21 lines, removed 11 lines
+      115        expect(accessions(withAmendment)).toEqual(['4', '1']);
+      116      });
+      117  
+      118 -    it('filters on report date with inclusive bounds', async (
+          -) => {                                                        
+      118 +    it('filters on filing date with inclusive bounds', async (
+          +) => {                                                        
+      119        const filings = await listItems('AAPL', {
+      120 -        startDate: '2023-12-31',                              
+      121 -        endDate: '2024-02-28',                                
+      120 +        startDate: '2024-02-01',                              
+      121 +        endDate: '2024-03-01',                                
+      122        });
+      123  
+      124 -      expect(accessions(filings)).toEqual(['3', '4', '1']);   
+      124 +      expect(accessions(filings)).toEqual(['3', '2', '4']);   
+      125      });
+      126  
+      127 +    it('ignores the report date when filtering by date', async
+          + () => {                                                      
+      128 +      // Filing 1 was filed 2024-01-10 for a period ending 202
+          +3-12-31.                                                      
+      129 +      const filings = await listItems('AAPL', {               
+      130 +        startDate: '2024-01-01',                              
+      131 +        endDate: '2024-01-31',                                
+      132 +      });                                                     
+      133 +                                                              
+      134 +      expect(accessions(filings)).toEqual(['1']);             
+      135 +    });                                                       
+      136 +                                                              
+      137      it('supports open-ended date ranges', async () => {
+      138        const from = await listItems('AAPL', {
+      129 -        startDate: '2024-02-29',                              
+      139 +        startDate: '2024-03-01',                              
+      140        });
+      141        const until = await listItems('AAPL', {
+      132 -        endDate: '2023-12-31',                                
+      142 +        endDate: '2024-01-10',                                
+      143        });
+      144  
+      135 -      expect(accessions(from)).toEqual(['2']);                
+      136 -      expect(accessions(until)).toEqual(['4', '1']);          
+      145 +      expect(accessions(from)).toEqual(['5', '3', '2']);      
+      146 +      expect(accessions(until)).toEqual(['1']);               
+      147      });
+      148  
+      139 -    it('excludes filings without a report date when filtering 
+          -by date', async () => {                                       
+      149 +    it('includes filings without a report date when filtering 
+          +by date', async () => {                                       
+      150        const filings = await listItems('AAPL', {
+      141 -        startDate: '2000-01-01',                              
+      151 +        startDate: '2024-04-01',                              
+      152        });
+      153  
+      144 -      expect(accessions(filings)).not.toContain('5');         
+      154 +      expect(accessions(filings)).toEqual(['5']);             
+      155      });
+      156    });
+      157  
+
+● Bash(sed -i "108s/end-date=2024-05-02/end-date=2024-05-03/"
+      test/app.e2e-spec.ts && sed -n 104,118p test/app.e2e-spec.ts)
+  ⎿    });
+
+       it('GET /api/companies/:ticker/filings applies form type and date fi
+     … +13 lines (ctrl+o to expand)
+  ⎿  Updated test\app.e2e-spec.ts (+1 -1)
+      105  
+      106    it('GET /api/companies/:ticker/filings applies form type and
+            date filters', async () => {
+      107      const res = await get(
+      108 -      '/api/companies/AAPL/filings?form-type=10-k,8-K&form-typ
+          -e=4&start-date=2024-01-01&end-date=2024-05-02',               
+      108 +      '/api/companies/AAPL/filings?form-type=10-k,8-K&form-typ
+          +e=4&start-date=2024-01-01&end-date=2024-05-03',               
+      109      ).expect(200);
+      110  
+      111      expect(
+
+● Bash(sed -i "107i\\    // The 8-K was filed 2024-05-03, a day after its report
+      date; the range\\n    // applies to the filing date, so end-date must
+      reach 2024-05-03…)
+  ⎿    it('GET /api/companies/:ticker/filings applies form type and date fi
+     lters', async () => {
+         // The 8-K was filed 2024-05-03, a day after its report date; the
+     … +87 lines (ctrl+o to expand)
+  ⎿  Updated test\app.e2e-spec.ts (+2 -0)
+      104    });
+      105  
+      106    it('GET /api/companies/:ticker/filings applies form type and
+            date filters', async () => {
+      107 +    // The 8-K was filed 2024-05-03, a day after its report da
+          +te; the range                                                 
+      108 +    // applies to the filing date, so end-date must reach 2024
+          +-05-03.                                                       
+      109      const res = await get(
+      110        '/api/companies/AAPL/filings?form-type=10-k,8-K&form-typ
+           e=4&start-date=2024-01-01&end-date=2024-05-03',
+      111      ).expect(200);
+
+● Update(README.md)
+  ⎿  Added 62 lines, removed 1 line
+      23  
+      24  ## Description
+      25  
+      26 -[Nest](https://github.com/nestjs/nest) framework TypeScript sta
+         -rter repository.                                               
+      26 +An API for looking up companies and their SEC filings, backed b
+         +y [SEC EDGAR](https://www.sec.gov/edgar). Built with [Nest](htt
+         +ps://github.com/nestjs/nest).                                  
+      27  
+      28 +## API                                                         
+      29 +                                                               
+      30 +Every response, successful or not, uses the same envelope. `sta
+         +tus` mirrors the HTTP status code:                             
+      31 +                                                               
+      32 +```json                                                        
+      33 +{ "data": { ... }, "error": null, "status": 200 }              
+      34 +{ "data": null, "error": { "message": "...", "status": 404 }, "
+         +status": 404 }                                                 
+      35 +```                                                            
+      36 +                                                               
+      37 +Errors from SEC are forwarded with SEC's status code and messag
+         +e.                                                             
+      38 +                                                               
+      39 +### `GET /api/companies/{ticker}`                              
+      40 +                                                               
+      41 +Looks up a company. The ticker is case-insensitive.            
+      42 +                                                               
+      43 +```json                                                        
+      44 +{ "cik": 320193, "ticker": "AAPL", "name": "Apple Inc." }      
+      45 +```                                                            
+      46 +                                                               
+      47 +### `GET /api/companies/{ticker}/filings`                      
+      48 +                                                               
+      49 +Lists the company's filings, newest first by filing date.      
+      50 +                                                               
+      51 +| Query parameter | Description |                              
+      52 +| --- | --- |                                                  
+      53 +| `form-type` | Form types to include, comma-separated or repea
+         +ted (`10-K,8-K`). Matching is exact and case-insensitive: amend
+         +ments such as `10-K/A` are only included when requested explici
+         +tly. |                                                         
+      54 +| `start-date`, `end-date` | Inclusive `YYYY-MM-DD` range on th
+         +e **filing date**. |                                           
+      55 +| `limit` | Page size, 1 to 200. Defaults to 50. |             
+      56 +| `cursor` | The `nextCursor` from the previous page. It must b
+         +e used with the same filters as the first page, otherwise the r
+         +equest fails with 400. |                                       
+      57 +                                                               
+      58 +```json                                                        
+      59 +{                                                              
+      60 +  "items": [                                                   
+      61 +    {                                                          
+      62 +      "accessionNumber": "0000320193-25-000079",               
+      63 +      "formType": "10-K",                                      
+      64 +      "filingDate": "2025-10-31",                              
+      65 +      "reportDate": "2025-09-27",                              
+      66 +      "primaryDocumentUrl": "https://www.sec.gov/Archives/edgar
+         +/data/320193/000032019325000079/aapl-20250927.htm"             
+      67 +    }                                                          
+      68 +  ],                                                           
+      69 +  "pagination": { "limit": 50, "total": 1, "nextCursor": null, 
+         +"next": null }                                                 
+      70 +}                                                              
+      71 +```                                                            
+      72 +                                                               
+      73 +`total` counts all matching filings. To read every page, follow
+         + `next` (a relative URL) until it is `null`.                   
+      74 +                                                               
+      75 +`reportDate` is the end of the period the filing covers. It is 
+         +`null` for filings without one, such as many prospectuses.     
+      76 +                                                               
+      77 +> **Date filter changed:** `start-date` and `end-date` used to 
+         +filter on the report date and left out filings without one. The
+         +y now filter on the filing date, the same date the list is sort
+         +ed by, so every filing can match a date range.                 
+      78 +                                                               
+      79 +### `GET /api/companies/{ticker}/filings/{accessionNumber}`    
+      80 +                                                               
+      81 +Fetches one filing of the company. The accession number may be 
+         +written with or without dashes (`0000320193-25-000079` or `0000
+         +32019325000079`). The response is a single filing, shaped like 
+         +an item above.                                                 
+      82 +                                                               
+      83 +### Limitations                                                
+      84 +                                                               
+      85 +- **Only recent filings are available.** The API reads SEC's "r
+         +ecent" filings, which hold a company's latest 1,000 filings or 
+         +its last year of filings, whichever is more. For most companies
+         + that reaches back several years (Apple: to 2015), but for very
+         + frequent filers it can be about a year (JPMorgan: to late 2025
+         +). Older filings are not listed and cannot be fetched by access
+         +ion number.                                                    
+      86 +- SEC data is cached in memory: the ticker list for 24 hours an
+         +d each company's filings for 10 minutes, so new filings can tak
+         +e up to 10 minutes to appear.                                  
+      87 +- Requests to SEC are limited to 7 per second per running insta
+         +nce.                                                           
+      88 +                                                               
+      89  ## Project setup
+      90  
+      91  ```bash
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The date filter now uses the filing date, and the recent-filings limit is
+  documented. Everything passes, but nothing is committed yet. Your other two
+  choices (keep the ticker in the single-filing route, leave the empty-document
+  link as is) needed no code changes.
+
+  2b – the date filter now uses the filing date
+  - start-date/end-date now filter on filingDate, the same date the list is
+    sorted by. Filings without a report date are no longer dropped.
+  - The old report-date check in companies.service.ts is gone. The method's doc
+    comment describes the new rule.
+  - Tests:
+    - New: the filing date's start and end dates are both included; filings
+      without a report date are now included.
+    - New: a filing filed in January for a December period matches a January
+      range. This one would fail under the old behavior.
+    - Updated: one e2e test's dates, with a comment explaining the 8-K filed one
+      day after its report date.
+
+  1b – limit documented in the README
+  - I replaced the README's boilerplate description and added an API section. It
+    covers the response wrapper, all three endpoints, every query parameter,
+    the response shapes and pagination.
+  - The Date filter changed note says what the filter used to do and what it
+    does now.
+  - Limitations:
+    - Only SEC's "recent" filings are available: the latest 1,000 or the last
+      year, whichever is more. That reaches back to 2015 for Apple but only to
+      late 2025 for JPMorgan, and older filings can't be listed or fetched by
+      accession number.
+    - Caching can delay new filings by up to 10 minutes.
+    - Requests to SEC are limited to 7 per second per running instance.
+  - I didn't add a field in the API response about the limit; it's documented in
+    the README only. A response field can be added if clients need to detect it
+    in code.
+
+  Checks: type check and lint are clean, prettier is clean with the project's
+  version, and 94 unit tests plus 31 e2e tests pass.
+
+  Should I commit this on master?
+
+✻ Baked for 1m 28s · done 17:26
+
+❯ yes, commit it.                                                               
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I committed the date filter switch and the README on master as 89f4d32,
+  "Filter filings by filing date and document the API". Nothing is left
+  uncommitted, and nothing has been pushed.
+
+  Git warned that README.md has Windows line endings (CRLF), which it will
+  switch to LF the next time the file is touched. That's harmless.
+
+✻ Baked for 5s · done 17:26
+
+❯ Look over the code and see if there are any missing tests or other things     
+  that look weird / could be improved. Report to me when done. Use subagents to 
+  work faster.                                                                  
+
+● 2 background agents launched (↓ to manage)
+   ├ Review edgar + common layers
+   └ Review companies layer + e2e
+
+● I've started two reviewers in parallel. One covers the SEC layer (rate
+  limiter, cache, SEC service) and the shared response and error handling. The
+  other covers the companies endpoints, paging, validation and the e2e tests.
+  Neither will change any files. I'll check their findings and send you one
+  report when both finish.
+
+✻ Crunched for 22s · done 17:28
+
+› Message from general-purpose
+  Review of C:\Code\edgar-api, covering src/edgar, src/common,
+  app/main/configure-app, package.json and the README API section. No files were
+  edited. `tsc --noEmit` is clean, and both suites pass: 94 unit tests and 31
+  e2e tests.
+
+  ## Bugs
+  - **src/edgar/edgar.service.ts:40 — med** — `fetch` is called with no timeout
+  or `AbortSignal`. If SEC stalls, the request hangs until undici's default
+  header/body timeout of about 300s. `CachedEdgarService`
+  (cached-edgar.service.ts:61-69) shares that in-flight promise, so every caller
+  for the same key (the ticker list sits in front of every endpoint) hangs with
+  it. **Fix:** pass `signal: AbortSignal.timeout(N)` and map the abort to
+  `EdgarUpstreamError(504 or 502, 'SEC EDGAR timed out')`.
+  - **src/edgar/edgar.service.ts:62 — med** — `(await response.json()) as T`
+  never checks the shape. A 200 with unexpected JSON (for example `{}`, or a
+  missing `filings.recent`) then crashes in companies.service.ts:88/119 or
+  ticker-cik.service.ts:14 with a TypeError. The filter turns that into a 500
+  "Internal server error", where the agreed contract says bad upstream data is a
+  502. **Fix:** validate the minimal shape in `EdgarService` (zod is already a
+  dependency) and throw `EdgarUpstreamError(502, ...)` when it fails.
+  - **src/edgar/rate-limiter.service.ts:52 — low/med** — The sliding window uses
+  `Date.now()`, which is wall-clock time. If the system clock steps backwards
+  (NTP correction, VM resume), the existing `startTimes` sit in the future. They
+  stop being pruned and `waitMs` (line 67) becomes as large as the jump, so all
+  SEC traffic stalls for that long. The same clock issue affects cache TTLs at
+  cached-edgar.service.ts:57 and :65, which would be extended. **Fix:** use
+  `performance.now()`. Vitest fake timers also fake it.
+  - **src/edgar/edgar.service.ts:61-67 — low** — Any failure while reading the
+  body, including a connection reset mid-body, is reported as "SEC EDGAR
+  returned an invalid JSON response". **Fix:** read with `response.text()`
+  inside the network-error branch, then `JSON.parse` separately so each failure
+  gets the right message.
+  - **src/edgar/cik-padding.service.ts:12 — low** — It throws a plain `Error`,
+  so an invalid CIK becomes an opaque 500. That can't come from a request today,
+  because CIKs only come from the ticker list. But a malformed ticker entry
+  would also surface as a 500, not a 502. **Fix:** throw
+  `EdgarUpstreamError(502, ...)`, or make padding a pure function and validate
+  the ticker list as in the shape-check fix above.
+
+  ## Missing tests (business behaviour)
+  - **test/app.e2e-spec.ts:46 — med** — The e2e suite replaces all of
+  `EdgarService`, so the real SEC→HTTP error mapping is never tested end to end.
+  That covers XML message extraction, the HTML fallback to status text, network
+  failure → 502 and bad JSON → 502. The gap already shows: the fixture at :293
+  uses `'Failed to reach SEC: fetch failed'`, but the code produces `'Failed to
+  reach SEC EDGAR: fetch failed'` (edgar.service.ts:50). **Fix:** add e2e cases
+  that stub global `fetch` and keep the real `EdgarService`, cache and limiter.
+  - **src/edgar/edgar.service.spec.ts:55-63 — med** — "routes every request
+  through the rate limiter" only spies on `rateLimiter.schedule`, which is an
+  implementation detail. **Fix:** replace it with a behaviour test using fake
+  timers. Fire 8 calls to SEC and assert `fetch` ran 7 times immediately and the
+  8th only after 1s.
+  - **src/edgar/edgar.service.spec.ts:44-49 — low** — `padSpy` asserts an
+  internal call. The URL assertion on the following lines already covers the
+  behaviour. **Fix:** drop the spy.
+  - **src/edgar/edgar.service.spec.ts — low** — Several error-message cases are
+  untested:
+    - truncation of long error bodies to 200 characters plus `...` (line 89);
+    - the empty-body fallback (the test named "HTML or empty bodies" only covers
+  HTML);
+    - the `SEC EDGAR request failed with status N` fallback when `statusText` is
+  empty;
+    - a non-`Error` network rejection.
+  - **src/edgar/cached-edgar.service.spec.ts — low** — Three cache behaviours
+  are untested:
+    - Concurrent requests that arrive after a cached entry has expired should
+  share one refresh. Only the cold-cache case is tested.
+    - An error from the ticker list should not be cached. Only submissions are
+  tested for this.
+    - The ticker list and a company's submissions should expire on their own
+  TTLs without affecting each other.
+  - **e2e — low** — Nothing tests over HTTP that a repeat request is served
+  without calling SEC again. README:86 documents this behaviour.
+
+  ## Improvements
+  - **src/common/api-exception.filter.ts:30-32 — med** — `EdgarUpstreamError` is
+  returned without being logged, so SEC outages, 502s and 429s never appear in
+  the logs. 5xx `HttpException`s aren't logged either. **Fix:** log at
+  warn/error level when `status >= 500` or the status is 429.
+  - **src/edgar/edgar.service.ts:47 — low** — undici's message is always just
+  "fetch failed", and the useful detail is in `error.cause` (ENOTFOUND,
+  ECONNRESET, ...). **Fix:** include `cause.code` or `cause.message` in the 502
+  message, or at least log it.
+  - **src/edgar/cached-edgar.service.ts:45 and edgar.service.ts:30 — low** — The
+  CIK is padded and validated twice, and the "rejects an invalid CIK" test is
+  duplicated in both spec files. **Fix:** pad in one layer only.
+  `CikPaddingService` is also a stateless one-liner that could be a plain
+  exported function rather than an injectable.
+  - **src/edgar/edgar.module.ts:15 — low** — `CikPaddingService` is exported,
+  but nothing outside `EdgarModule` uses it. **Fix:** drop it from `exports`.
+  - **src/edgar/rate-limiter.service.ts:14 — low** — The `RATE_LIMIT_OPTIONS`
+  token is never provided anywhere; tests construct the limiter directly.
+  **Fix:** either wire the token up through config or remove the token and
+  `@Optional` and use the constant.
+  - **README.md:37 — low** — It says SEC errors are forwarded "with SEC's status
+  code and message". It doesn't mention that unreachable SEC or a bad response
+  gives a 502 with the API's own message, or that HTML error pages are replaced
+  with the HTTP status text. **Fix:** add one sentence.
+  - **README.md:86 — low** — The limitations list says new filings can take up
+  to 10 minutes to appear. It doesn't say that new or changed tickers can take
+  up to 24h to resolve. **Fix:** add that.
+  - **README.md:5-22 and 121-193; package.json:4,11 — low** — Nest scaffold
+  boilerplate is still in place:
+    - README:5 has a `circleci-image` link containing `?token=abc123def456`;
+    - the badges and Mau, Observe, Support and "Stay in touch" sections are
+  Nest's own;
+    - package.json has an empty `description` and a `deploy: nest deploy`
+  script.
+
+    **Fix:** trim them, or confirm they are intended.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Agent "Review edgar + common layers" finished · 2m 26s
+
+● The SEC-layer reviewer has finished. I've confirmed its main points (no
+  timeout on SEC requests, no shape check on SEC's JSON), and I'm waiting for
+  the companies-layer reviewer before reporting.
+
+✻ Brewed for 10s · done 17:31
+
+› Message from general-purpose
+  I reviewed the code and ran both suites: 94 unit tests and 31 e2e tests pass.
+  I also ran a throwaway probe, the full app with a fake SEC service, at
+  C:\Users\pihlj\AppData\Local\Temp\claude\C--Code-edgar-api\a3d8a260-fa4e-4a80-
+  a634-68b3191d6ef0\scratchpad\probe.e2e-spec.ts. Every bug below was seen in
+  that run, and no project files were edited. The code does what was agreed with
+  one gap: a cursor is not tied to the company it came from.
+
+  ## Bugs
+
+  - **src/companies/filing-cursor.ts:78-87 (and companies.service.ts:50) — med —
+  A cursor from one ticker is accepted for another.** The cursor stores only
+  the filters, not the company. In the probe, AAPL's `nextCursor` sent to
+  `/api/companies/MSFT/filings?limit=1&cursor=…` returned 200 and started MSFT's
+  list at AAPL's position, which silently skips filings. Fix: put the CIK or
+  upper-cased ticker into the cursor payload, reject a mismatch with 400, and
+  widen the `FILTERS_CHANGED` text (or add a separate message).
+
+  - **src/companies/companies.schemas.ts:8-20 — low/med — Date errors repeat
+  themselves.**
+    - The pipe already adds the field name, so it shows twice.
+    - The calendar check still runs after the format check fails, so one bad
+  value gives two errors.
+    - Probe output for `start-date=2024-1-1`: `"start-date: start-date must be
+  in YYYY-MM-DD format; start-date: start-date must be a valid calendar date"`.
+    - Fix: drop `${name}` from the messages (or the prefix) and stop after the
+  first failure, e.g. `.regex(..., { abort: true })` or use `z.iso.date()`.
+    - The same doubled prefix shows up for limit: `"limit: limit must be an
+  integer between 1 and 200"`.
+
+  - **src/companies/companies.schemas.ts:39-47 — low — Repeating a single-value
+  parameter gives an unclear message.** `?limit=1&limit=2`, a repeated
+  `start-date` or `end-date`, or `cursor=a&cursor=b` returns 400 `"limit:
+  Invalid input: expected string, received array"`. The 400 is right; the
+  message is not. Fix: give `z.string()` a custom error such as "limit must be
+  given once".
+
+  - **src/companies/companies.schemas.ts:36 — low — Misspelled parameters are
+  silently ignored.** `z.object` drops unknown keys, so `?formType=10-K` returns
+  200 with no filter applied. Fix: `.strict()` with a message listing the
+  supported parameters, or say in the README that unknown parameters are
+  ignored.
+
+  - **src/companies/ticker-cik.service.ts:10-14 — low (documentation) — `BRK.B`
+  returns 404.** SEC lists the class-B ticker as `BRK-B`, and the code only does
+  exact case-insensitive matching. `BRK-B` works, `brk.b` gets 404, and
+  `/companies/%20aapl%20` gets 404. This matches the agreed behaviour, but it
+  will catch users. Fix: note in the README that tickers follow SEC's spelling
+  (`BRK-B`), or treat `.` as `-` (that would change the agreed behaviour).
+
+  The `next` URL checked out:
+  - Odd query strings round-trip correctly.
+  `form-type=10-k%2F%41,%2010-Q&x=a%20b+c&empty&dup=1&dup=2#frag` came back as
+  `form-type=10-k%2FA%2C+10-Q&x=a+b+c&empty=&dup=1&dup=2&cursor=…`. That is
+  re-encoded but means the same.
+  - A trailing slash is kept.
+  - The fragment is dropped.
+  - Only the cursor is replaced.
+
+  ## Missing tests (business behaviour)
+
+  - **filing-cursor.ts — Cursor reused on a different ticker should be 400.**
+  This covers the first bug, once it is fixed.
+  - **test/app.e2e-spec.ts:121-161 — Following `next` with special characters.**
+  Walk the pages with values like `form-type=10-K/A` and `form-type=10-K, 8-K`
+  (space after the comma) and check that the filters stay applied and no filing
+  repeats.
+  - **companies.service.spec.ts:178-204 — Total is an exact multiple of the
+  limit** (e.g. 4 filings, limit 2). The last page is full and must still return
+  `nextCursor: null`. Existing tests only end on a partial page or fit on one
+  page.
+  - **companies.schemas.spec.ts:55-62 — `end-date` validation is not tested
+  anywhere.** Only `start-date` has tests for bad format and impossible dates.
+  - **test/app.e2e-spec.ts:183-191 — Message text for bad `limit` and malformed
+  cursor is not checked.** The tests check only the status, so the "explanatory
+  message" requirement and the doubled prefix above go unnoticed.
+  - **e2e — Repeating `limit`, `start-date`, `end-date` or `cursor` should give
+  400.** Untested.
+  - **e2e — Amendments over HTTP.** `form-type=10-K` should leave out `10-K/A`,
+  and `form-type=10-K/A` should include it. The fixture has no amendment, so
+  this is only covered in the service tests.
+  - **e2e — A missing report date becomes `null` over HTTP.**
+  - **test/app.e2e-spec.ts:216-226 — The single-filing test checks only part of
+  the response.** It uses `toMatchObject`, so it never checks the whole filing
+  shape or `primaryDocumentUrl`. Use `toEqual`.
+  - **e2e — Malformed accession numbers.** Only `not-a-number` is tried. Add
+  wrong lengths (`0000320193-24-00012`) and a mixed form (`0000320193-24000002`,
+  which is accepted and normalized).
+  - **e2e — Tickers with a hyphen.** `BRK-B` is tested only in
+  `TickerCikService`. If `BRK.B` stays a 404, a test should pin that.
+
+  ## Improvements
+
+  - **companies.service.spec.ts:64-68, 72-75, 291-297 — Some tests check
+  internal calls, which the owner said not to do.**
+    - Line 66 checks `resolve` was called with `'aapl'`.
+    - Line 67 checks `getSubmissions` was not called.
+    - Line 75 checks `getSubmissions` was called with `320193`.
+    - Line 296 ("without calling SEC") checks `getSubmissions` was not called.
+    - Fix: remove those assertions. The URL check already covers the CIK
+  mapping.
+  - **companies.controller.ts:25 — The query type is written out by hand,** `{
+  filters: FilingFilters; page: PageRequest }`, so it can drift from the schema.
+  Use `z.output<typeof filingsQuerySchema>`.
+  - **companies.service.ts:50 — `after` is typed `"" | FilingPosition |
+  undefined`** because it comes from `page.cursor && …`. Use `page.cursor ?
+  decodeFilingCursor(...) : undefined`.
+  - **companies.service.ts:111-116 — The sort uses `localeCompare`,** which
+  depends on the locale. Plain `<`/`>` comparison is exact for ISO dates and
+  fixed-width accession numbers.
+  - **filing-cursor.ts:69-71 and companies.schemas.ts:4,11 — The date and
+  accession-number regexes are written twice.** Share one constant each.
+  - **companies.service.ts:47 — The default `page` parameter only exists for
+  tests;** the controller always passes one. Make it required.
+  - **README.md:47-81 — The API section leaves things out:**
+    - the accession-number tie-break in the sort order;
+    - that blank `form-type` values are ignored;
+    - the 400 cases (malformed cursor, bad dates, start after end, bad limit);
+    - the 404 for an unknown filing;
+    - that only recent filings can be fetched by accession number (this one is
+  in Limitations, but not next to the endpoint).
+  - **README.md:77 — The "Date filter changed" note is changelog text inside the
+  API reference.** Move it to a changelog or release notes.
+  - **README.md:1-22, 121-193 — The Nest starter boilerplate is still there**
+  (badges, Mau, support and author sections). Trim it.
+  - **test/app.e2e-spec.ts:293 — The fake message `'Failed to reach SEC: fetch
+  failed'` doesn't match the real text,** which is `'Failed to reach SEC EDGAR:
+  …'` (edgar.service.ts:50). Harmless, but misleading as an example.
+  - **Outside scope — `GET //api/companies/AAPL/filings` returns 404 with body
+  `{}` instead of the envelope.** It happens before routing, so it is noted
+  only.
+
+● Both reviews are done. The two findings that matter most are SEC requests with
+  no timeout, and a cursor from one company being accepted for another. I
+  checked those, and the doubled error messages; nothing has been changed yet.
+  Both suites pass (94 unit, 31 e2e).
+
+  Bugs
+
+  Medium
+  1. No timeout on SEC requests (src/edgar/edgar.service.ts:40). If SEC stops
+     responding, a request hangs for about 5 minutes. Because concurrent
+     requests share one SEC call, every request for that company hangs with it,
+     and every endpoint if it's the ticker list. Fix: a timeout of a few seconds
+     that returns a 504 (or 502).
+  2. A cursor from one ticker is accepted for another
+     (src/companies/filing-cursor.ts). AAPL's nextCursor sent to
+     /companies/MSFT/filings returns 200 and starts MSFT's list at AAPL's
+     position, which silently skips filings. Fix: put the CIK in the cursor and
+     return a 400 on a mismatch.
+  3. Unexpected SEC data gives a 500 instead of a 502 (edgar.service.ts:62). If
+     SEC returns valid JSON in an unexpected shape, the code crashes with
+     "Internal server error". Fix: check the minimal shape (zod is already
+     installed) and return a 502.
+
+  Low
+
+  4. Date and limit errors repeat themselves. start-date=2024-1-1 returns:
+     "start-date: start-date must be in YYYY-MM-DD format; start-date: 
+     start-date must be a valid calendar date". The field name appears twice,
+     and the date gets two errors. I saw the same live earlier. Fix: drop the
+     field name from the message text and stop after the first failure.
+  5. Repeating a single-value parameter gives an unclear message.
+     ?limit=1&limit=2 (also start-date, end-date, cursor) returns "limit: 
+     Invalid input: expected string, received array". The 400 is right but the
+     message isn't.
+  6. Misspelled parameters are silently ignored. ?formType=10-K returns 200 with
+     no filter applied. Fix: reject unknown parameters with a 400, or document
+     that they're ignored.
+  7. The rate limiter and cache use the wall clock. If the system clock jumps
+     backwards (NTP correction, VM resume), all SEC requests can pause for as
+     long as the jump, and cached entries live longer. Fix: performance.now().
+  8. Error messages are vague.
+     - A connection that drops while the body is downloading is reported as
+       "invalid JSON".
+     - The useful detail behind "fetch failed" (ENOTFOUND, ECONNRESET…) is never
+       shown.
+  9. BRK.B returns 404; only SEC's BRK-B works. That matches the agreed behavior
+     (exact match, ignoring case), but users will hit it. Fix: document it, or
+     treat . as -.
+
+  Missing tests (behavior only)
+
+  - The real SEC error mapping is never tested over HTTP. The e2e tests replace
+    EdgarService, so the following only exist as unit tests:
+    - extracting SEC's XML error message;
+    - the fallback for HTML error pages;
+    - network failures and bad JSON returning a 502.
+
+    Fix: e2e tests that fake fetch and keep the real SEC service, cache and rate
+    limiter.
+  - Paging:
+    - A cursor reused with a different ticker returns a 400 (once bug 2 is
+      fixed).
+    - A total that's an exact multiple of the limit: the last page is full and
+      must still return nextCursor: null.
+    - Following next with special characters in the filters, e.g. 10-K/A or
+      10-K, 8-K.
+  - Validation:
+    - end-date validation isn't tested at all.
+    - The messages for a bad limit or a malformed cursor are never checked; the
+      tests only check the status.
+    - Repeated single-value parameters return a 400.
+    - More malformed accession numbers: wrong length, partly dashed.
+  - Over HTTP:
+    - Amendments are left out of form-type=10-K and included with 10-K/A.
+    - A missing report date comes back as null.
+    - The full single-filing response, including the URL. The current test only
+      checks part of it.
+    - Hyphenated tickers like BRK-B.
+  - Cache:
+    - After an entry expires, concurrent requests share one refresh. Only the
+      empty-cache case is tested.
+    - Errors from the ticker list aren't cached. Only company filings are tested
+      for this.
+    - A repeat request over HTTP doesn't call SEC again.
+  - SEC error messages: truncation of long error bodies, an empty body, an empty
+    status text.
+
+  Improvements
+
+  Logging: SEC errors and other 5xx/429 responses are never logged
+  (src/common/api-exception.filter.ts), so SEC outages are invisible in the
+  logs. This is the most useful improvement.
+
+  Code cleanup
+  - The CIK is padded and validated twice, once in the cache wrapper and once in
+    the SEC service. CikPaddingService could also be a plain function.
+  - Unused pieces:
+    - CikPaddingService is exported from EdgarModule but never used outside it.
+    - The RATE_LIMIT_OPTIONS setting is never set anywhere.
+  - Code that can drift or is loosely typed:
+    - The controller's query type is written out by hand, so it can drift from
+      the schema. Derive it from the schema instead.
+    - after is typed "" | FilingPosition | undefined.
+    - The default page argument only exists for tests.
+  - The sort uses localeCompare, which depends on locale settings. Plain </>
+    comparison is exact for these values.
+  - The date and accession-number patterns are written twice (validation and
+    cursor).
+  - An invalid CIK throws a plain Error, which becomes a 500.
+
+  Tests that check implementation details (you said to leave these for now):
+  - edgar.service.spec: the padding spy, and "routes every request through the
+    rate limiter". The latter should become a test of the actual 7-per-second
+    behavior.
+  - The internal-call checks in companies.service.spec.
+
+  Small inconsistencies
+  - One e2e fake error message ('Failed to reach SEC: …') differs from the real
+    text ('Failed to reach SEC EDGAR: …'). Harmless.
+  - GET //api/... returns 404 with {} instead of the wrapper. It fails before
+    Nest's routing, so it's minor.
+
+  README
+  - Missing from the API section:
+    - the 400 and 404 cases;
+    - that blank form-type values are ignored;
+    - the accession-number tie-break in the sort order;
+    - that SEC being unreachable gives a 502 with our own message;
+    - that new tickers can take up to 24 hours to appear.
+  - The "Date filter changed" note is changelog text inside the API reference.
+  - Nest's starter content is still there (badges, Mau, Observe, Support
+    sections).
+  - package.json has an empty description and a leftover deploy script.
+
+  Suggested order
+
+  1. Bugs 1–3: timeout, cursor tied to its company, SEC response shape check.
+  2. Logging upstream errors, and clearer validation messages (bugs 4–5).
+  3. The missing tests.
+  4. Cleanup and README.
+
+  Which of these do you want me to fix?
+
+✻ Cooked for 24s · done 17:34
+
+● Agent "Review companies layer + e2e" finished · 5m 28s
+
+❯ This is all okay, let's leave it and update the readme so it starts with      
+  instructions on how to run the code, include some example requests. Also add  
+  a section that mentions the TODOs we've deliberately left out, nothing big    
+  just mention that we've left it for future implementation.                    
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Bash(S=/c/Users/pihlj/AppData/Local/Temp/claude/C--Code-edgar-api/a3d8a260-fa4
+      e-4a80-a634-68b3191d6ef0/scratchpad && cat > $S/readme-top.md <<'EOF'
+      # edgar-api…)
+  ⎿  1:# edgar-api
+     5:## Getting started
+     10:# install dependencies
+     … +25 lines (ctrl+o to expand)
+  ⎿  Updated README.md (+197 -193)
+        1 -<p align="center">                                            
+        2 -  <a href="http://nestjs.com/" target="blank"><img src="https:
+          -//nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /
+          -></a>                                                         
+        3 -</p>                                                          
+        4 -                                                              
+        5 -[circleci-image]: https://img.shields.io/circleci/build/github
+          -/nestjs/nest/master?token=abc123def456                        
+        6 -[circleci-url]: https://circleci.com/gh/nestjs/nest           
+        7 -                                                              
+        8 -  <p align="center">A progressive <a href="http://nodejs.org" 
+          -target="_blank">Node.js</a> framework for building efficient a
+          -nd scalable server-side applications.</p>                     
+        9 -    <p align="center">                                        
+       10 -<a href="https://www.npmjs.com/~nestjscore" target="_blank"><i
+          -mg src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NP
+          -M Version" /></a>                                             
+       11 -<a href="https://www.npmjs.com/~nestjscore" target="_blank"><i
+          -mg src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Pa
+          -ckage License" /></a>                                         
+       12 -<a href="https://www.npmjs.com/~nestjscore" target="_blank"><i
+          -mg src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt=
+          -"NPM Downloads" /></a>                                        
+       13 -<a href="https://circleci.com/gh/nestjs/nest" target="_blank">
+          -<img src="https://img.shields.io/circleci/build/github/nestjs/
+          -nest/master" alt="CircleCI" /></a>                            
+       14 -<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src=
+          -"https://img.shields.io/badge/discord-online-brightgreen.svg" 
+          -alt="Discord"/></a>                                           
+       15 -<a href="https://opencollective.com/nest#backer" target="_blan
+          -k"><img src="https://opencollective.com/nest/backers/badge.svg
+          -" alt="Backers on Open Collective" /></a>                     
+       16 -<a href="https://opencollective.com/nest#sponsor" target="_bla
+          -nk"><img src="https://opencollective.com/nest/sponsors/badge.s
+          -vg" alt="Sponsors on Open Collective" /></a>                  
+       17 -  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><
+          -img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg
+          -" alt="Donate us"/></a>                                       
+       18 -    <a href="https://opencollective.com/nest#sponsor"  target=
+          -"_blank"><img src="https://img.shields.io/badge/Support%20us-O
+          -pen%20Collective-41B883.svg" alt="Support us"></a>            
+       19 -  <a href="https://twitter.com/nestframework" target="_blank">
+          -<img src="https://img.shields.io/twitter/follow/nestframework.
+          -svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
+       20 -</p>                                                          
+       21 -  <!--[![Backers on Open Collective](https://opencollective.co
+          -m/nest/backers/badge.svg)](https://opencollective.com/nest#bac
+          -ker)                                                          
+       22 -  [![Sponsors on Open Collective](https://opencollective.com/n
+          -est/sponsors/badge.svg)](https://opencollective.com/nest#spons
+          -or)-->                                                        
+       23 -                                                              
+       24 -## Description                                                
+       25 -                                                              
+       26 -An API for looking up companies and their SEC filings, backed 
+          -by [SEC EDGAR](https://www.sec.gov/edgar). Built with [Nest](h
+          -ttps://github.com/nestjs/nest).                               
+       27 -                                                              
+       28 -## API                                                        
+       29 -                                                              
+       30 -Every response, successful or not, uses the same envelope. `st
+          -atus` mirrors the HTTP status code:                           
+       31 -                                                              
+       32 -```json                                                       
+       33 -{ "data": { ... }, "error": null, "status": 200 }             
+       34 -{ "data": null, "error": { "message": "...", "status": 404 }, 
+          -"status": 404 }                                               
+       35 -```                                                           
+       36 -                                                              
+       37 -Errors from SEC are forwarded with SEC's status code and messa
+          -ge.                                                           
+       38 -                                                              
+       39 -### `GET /api/companies/{ticker}`                             
+       40 -                                                              
+     … 350 more lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Bash(sed -i 's/^Requires Node.js 24 or later (the version matching
+      `@types\/node`)\./Requires Node.js 20 or later (the minimum for Nest
+      12)./' README.md && sed -n 1,…)
+  ⎿  # edgar-api
+
+     An API for looking up companies and their SEC filings, backed by [SEC
+     … +28 lines (ctrl+o to expand)
+  ⎿  Updated README.md (+1 -1)
+       4  
+       5  ## Getting started
+       6  
+       7 -Requires Node.js 24 or later (the version matching `@types/node
+         -`).                                                            
+       7 +Requires Node.js 20 or later (the minimum for Nest 12).        
+       8  
+       9  ```bash
+      10  # install dependencies
+
+  Ran 3 shell commands (ctrl+o to expand)
+● Background command "Start built API on default port 3000" failed with exit
+code 127
+
+● The README now opens with how to run the API, followed by example requests,
+  and has a new Future work section. I ran each example against the live API and
+  all return 200. Nothing is committed yet.
+
+  New order:
+  1. Title and description. The Nest logo and badges at the top are gone, so the
+     README now starts with the project itself.
+  2. Getting started:
+     - Requires Node.js 20 or later, which is Nest 12's minimum (you run v26).
+     - Install, run (watch mode or production build) and the default port 3000,
+       set with PORT.
+     - No keys or configuration are needed.
+     - How to run the tests. The e2e tests fake SEC and need no network.
+  3. Example requests: curl commands for:
+     - company lookup;
+     - listing filings;
+     - filtering by form type and date with a page size;
+     - fetching the next page with cursor;
+     - fetching a single filing.
+
+     The filtered example returned 10 of 11 filings, and its next URL also gave
+     200.
+  4. API and Limitations: unchanged.
+  5. Future work (new), in four short points:
+     - older filings beyond SEC's recent list;
+     - cache invalidation;
+     - a memory limit for the cache;
+     - the smaller items from the code review: SEC request timeout, cursor tied
+       to its company, checking SEC's response shape, logging upstream errors,
+       clearer validation messages.
+
+  Also changed:
+  - The old "Project setup", "Compile and run" and "Run tests" sections were
+    merged into Getting started.
+  - The file now uses Unix line endings (LF), which also removes git's
+    line-ending warning.
+  - Nest's starter sections at the bottom (Deployment, Observability, Resources,
+    Support, Stay in touch, License) are still there. I can remove them if you
+    want.
+
+  Should I commit it on master?
+
+✻ Churned for 8m 16s · done 17:36
+
+❯ yes, commit it                                                                
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I committed the README update on master as b5b5daa, "Add getting started,
+  example requests and future work to README". Nothing is left uncommitted, and
+  nothing has been pushed.
+
+✻ Churned for 7s · done 17:36
