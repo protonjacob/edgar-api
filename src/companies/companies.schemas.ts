@@ -1,6 +1,8 @@
 import { z } from 'zod';
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT } from './filing.js';
 
 const ACCESSION_NUMBER = /^(\d{10})-?(\d{2})-?(\d{6})$/;
+const LIMIT_MESSAGE = `limit must be an integer between 1 and ${MAX_PAGE_LIMIT}`;
 
 /** A real calendar date in strict ISO `YYYY-MM-DD` form. */
 const isoDate = (name: string) =>
@@ -36,6 +38,13 @@ export const filingsQuerySchema = z
     'form-type': formTypes.optional(),
     'start-date': isoDate('start-date').optional(),
     'end-date': isoDate('end-date').optional(),
+    limit: z
+      .string()
+      .regex(/^\d+$/, LIMIT_MESSAGE)
+      .transform(Number)
+      .refine((n) => n >= 1 && n <= MAX_PAGE_LIMIT, LIMIT_MESSAGE)
+      .default(DEFAULT_PAGE_LIMIT),
+    cursor: z.string().min(1, 'cursor must not be empty').optional(),
   })
   .refine(
     (query) =>
@@ -45,9 +54,12 @@ export const filingsQuerySchema = z
     { message: 'start-date must not be after end-date' },
   )
   .transform((query) => ({
-    formTypes: query['form-type'],
-    startDate: query['start-date'],
-    endDate: query['end-date'],
+    filters: {
+      formTypes: query['form-type'],
+      startDate: query['start-date'],
+      endDate: query['end-date'],
+    },
+    page: { limit: query.limit, cursor: query.cursor },
   }));
 
 /** Accepts dashed or undashed accession numbers and normalizes to dashed. */

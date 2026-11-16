@@ -1,11 +1,13 @@
-import { Controller, Get, Param, Query } from '@nestjs/common';
+import { Controller, Get, Param, Query, Req } from '@nestjs/common';
+import type { Request } from 'express';
+import { type Paginated, toPaginated } from '../common/pagination.js';
 import { CompaniesService } from './companies.service.js';
 import {
   accessionNumberSchema,
   filingsQuerySchema,
 } from './companies.schemas.js';
 import type { Company } from './company.js';
-import type { Filing, FilingFilters } from './filing.js';
+import type { Filing, FilingFilters, PageRequest } from './filing.js';
 
 @Controller('companies')
 export class CompaniesController {
@@ -17,11 +19,18 @@ export class CompaniesController {
   }
 
   @Get(':ticker/filings')
-  listFilings(
+  async listFilings(
     @Param('ticker') ticker: string,
-    @Query({ schema: filingsQuerySchema }) filters: FilingFilters,
-  ): Promise<Filing[]> {
-    return this.companiesService.listFilings(ticker, filters);
+    @Query({ schema: filingsQuerySchema })
+    query: { filters: FilingFilters; page: PageRequest },
+    @Req() request: Request,
+  ): Promise<Paginated<Filing>> {
+    const page = await this.companiesService.listFilings(
+      ticker,
+      query.filters,
+      query.page,
+    );
+    return toPaginated(page, request.originalUrl);
   }
 
   @Get(':ticker/filings/:accessionNumber')

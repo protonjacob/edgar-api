@@ -1,8 +1,19 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { CachedEdgarService } from '../edgar/cached-edgar.service.js';
 import { EdgarRecentFilings } from '../edgar/edgar.types.js';
+import type { Page } from '../common/pagination.js';
 import { Company } from './company.js';
-import { Filing, FilingFilters } from './filing.js';
+import {
+  decodeFilingCursor,
+  encodeFilingCursor,
+  type FilingPosition,
+} from './filing-cursor.js';
+import {
+  DEFAULT_PAGE_LIMIT,
+  Filing,
+  FilingFilters,
+  PageRequest,
+} from './filing.js';
 import { TickerCikService } from './ticker-cik.service.js';
 
 const ARCHIVES_BASE_URL = 'https://www.sec.gov/Archives/edgar/data';
@@ -19,28 +30,39 @@ export class CompaniesService {
   }
 
   /**
-   * Lists the company's recent filings, newest first. Form types match
-   * exactly (case-insensitive), so amendments such as `10-K/A` are only
+   * Lists one page of the company's recent filings, newest first. Form types
+   * match exactly (case-insensitive), so amendments such as `10-K/A` are only
    * included when requested explicitly. The date range applies to the report
    * date and its bounds are inclusive.
+   *
+   * Pages continue after the cursor's position rather than at an offset, so
+   * filings that arrive between requests do not shift or repeat results.
    */
-  async listFilings(ticker: string, filters: FilingFilters): Promise<Filing[]> {
-    const filings = await this.getRecentFilings(ticker);
-    const formTypes = filters.formTypes?.map((type) => type.toUpperCase());
-    const { startDate, endDate } = filters;
+  async listFilings(
+    ticker: string,
+    filters: FilingFilters,
+    page: PageRequest = { limit: DEFAULT_PAGE_LIMIT },
+  ): Promise<Page<Filing>> {
+    // Decode first so a bad cursor fails before any upstream request.
+    const after = page.cursor && decodeFilingCursor(page.cursor, filters);
+    const filings = filterFilings(await this.getRecentFilings(ticker), filters);
 
-    return filings
-      .filter(
-        (filing) =>
-          !formTypes?.length ||
-          formTypes.includes(filing.formType.toUpperCase()),
-      )
-      .filter((filing) => isInDateRange(filing.reportDate, startDate, endDate))
-      .sort(
-        (a, b) =>
-          b.filingDate.localeCompare(a.filingDate) ||
-          b.accessionNumber.localeCompare(a.accessionNumber),
-      );
+    const start = after
+      ? filings.findIndex((filing) => newestFirst(filing, after) > 0)
+      : 0;
+    const remaining = start === -1 ? [] : filings.slice(start);
+    const items = remaining.slice(0, page.limit);
+    const last = items.at(-1);
+
+    return {
+      items,
+      limit: page.limit,
+      total: filings.length,
+      nextCursor:
+        last && remaining.length > items.length
+          ? encodeFilingCursor(last, filters)
+          : null,
+    };
   }
 
   /**
@@ -62,6 +84,27 @@ export class CompaniesService {
     const submissions = await this.edgarService.getSubmissions(cik);
     return toFilings(cik, submissions.filings.recent);
   }
+}
+
+function filterFilings(filings: Filing[], filters: FilingFilters): Filing[] {
+  const formTypes = filters.formTypes?.map((type) => type.toUpperCase());
+  const { startDate, endDate } = filters;
+
+  return filings
+    .filter(
+      (filing) =>
+        !formTypes?.length || formTypes.includes(filing.formType.toUpperCase()),
+    )
+    .filter((filing) => isInDateRange(filing.reportDate, startDate, endDate))
+    .sort(newestFirst);
+}
+
+/** Sort order of the filings list: filing date, then accession number, descending. */
+function newestFirst(a: FilingPosition, b: FilingPosition): number {
+  return (
+    b.filingDate.localeCompare(a.filingDate) ||
+    b.accessionNumber.localeCompare(a.accessionNumber)
+  );
 }
 
 // Dates are ISO `YYYY-MM-DD`, so string comparison orders them correctly.

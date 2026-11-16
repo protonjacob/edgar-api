@@ -9,7 +9,7 @@ describe('filingsQuerySchema', () => {
       'form-type': ['10-K, 8-K', '', '10-K/A'],
     });
 
-    expect(result.formTypes).toEqual(['10-K', '8-K', '10-K/A']);
+    expect(result.filters.formTypes).toEqual(['10-K', '8-K', '10-K/A']);
   });
 
   it('accepts a valid inclusive date range', () => {
@@ -17,12 +17,39 @@ describe('filingsQuerySchema', () => {
       filingsQuerySchema.parse({
         'start-date': '2024-01-01',
         'end-date': '2024-01-01',
-      }),
+      }).filters,
     ).toEqual({
       formTypes: undefined,
       startDate: '2024-01-01',
       endDate: '2024-01-01',
     });
+  });
+
+  it('defaults to a page of 50 without a cursor', () => {
+    expect(filingsQuerySchema.parse({}).page).toEqual({
+      limit: 50,
+      cursor: undefined,
+    });
+  });
+
+  it('accepts a limit between 1 and 200 and passes the cursor through', () => {
+    expect(filingsQuerySchema.parse({ limit: '1' }).page.limit).toBe(1);
+    expect(
+      filingsQuerySchema.parse({ limit: '200', cursor: 'abc' }).page,
+    ).toEqual({ limit: 200, cursor: 'abc' });
+  });
+
+  it.each(['0', '201', '-1', '1.5', 'ten', ''])('rejects limit %s', (limit) => {
+    const result = filingsQuerySchema.safeParse({ limit });
+
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0].message).toBe(
+      'limit must be an integer between 1 and 200',
+    );
+  });
+
+  it('rejects an empty cursor', () => {
+    expect(filingsQuerySchema.safeParse({ cursor: '' }).success).toBe(false);
   });
 
   it.each(['2024-1-01', '20240101', '2024-02-30', '2023-02-29', '2024-13-01'])(
