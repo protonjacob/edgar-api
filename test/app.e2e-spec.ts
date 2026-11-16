@@ -104,8 +104,10 @@ describe('Companies API (e2e)', () => {
   });
 
   it('GET /api/companies/:ticker/filings applies form type and date filters', async () => {
+    // The 8-K was filed 2024-05-03, a day after its report date; the range
+    // applies to the filing date, so end-date must reach 2024-05-03.
     const res = await get(
-      '/api/companies/AAPL/filings?form-type=10-k,8-K&form-type=4&start-date=2024-01-01&end-date=2024-05-02',
+      '/api/companies/AAPL/filings?form-type=10-k,8-K&form-type=4&start-date=2024-01-01&end-date=2024-05-03',
     ).expect(200);
 
     expect(

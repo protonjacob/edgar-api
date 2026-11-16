@@ -115,33 +115,43 @@ describe('CompaniesService', () => {
       expect(accessions(withAmendment)).toEqual(['4', '1']);
     });
 
-    it('filters on report date with inclusive bounds', async () => {
+    it('filters on filing date with inclusive bounds', async () => {
       const filings = await listItems('AAPL', {
-        startDate: '2023-12-31',
-        endDate: '2024-02-28',
+        startDate: '2024-02-01',
+        endDate: '2024-03-01',
       });
 
-      expect(accessions(filings)).toEqual(['3', '4', '1']);
+      expect(accessions(filings)).toEqual(['3', '2', '4']);
+    });
+
+    it('ignores the report date when filtering by date', async () => {
+      // Filing 1 was filed 2024-01-10 for a period ending 2023-12-31.
+      const filings = await listItems('AAPL', {
+        startDate: '2024-01-01',
+        endDate: '2024-01-31',
+      });
+
+      expect(accessions(filings)).toEqual(['1']);
     });
 
     it('supports open-ended date ranges', async () => {
       const from = await listItems('AAPL', {
-        startDate: '2024-02-29',
+        startDate: '2024-03-01',
       });
       const until = await listItems('AAPL', {
-        endDate: '2023-12-31',
+        endDate: '2024-01-10',
       });
 
-      expect(accessions(from)).toEqual(['2']);
-      expect(accessions(until)).toEqual(['4', '1']);
+      expect(accessions(from)).toEqual(['5', '3', '2']);
+      expect(accessions(until)).toEqual(['1']);
     });
 
-    it('excludes filings without a report date when filtering by date', async () => {
+    it('includes filings without a report date when filtering by date', async () => {
       const filings = await listItems('AAPL', {
-        startDate: '2000-01-01',
+        startDate: '2024-04-01',
       });
 
-      expect(accessions(filings)).not.toContain('5');
+      expect(accessions(filings)).toEqual(['5']);
     });
   });
 

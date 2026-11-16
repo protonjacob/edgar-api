@@ -32,8 +32,11 @@ export class CompaniesService {
   /**
    * Lists one page of the company's recent filings, newest first. Form types
    * match exactly (case-insensitive), so amendments such as `10-K/A` are only
-   * included when requested explicitly. The date range applies to the report
-   * date and its bounds are inclusive.
+   * included when requested explicitly. The date range applies to the filing
+   * date, the same date the list is sorted by, and its bounds are inclusive.
+   *
+   * Only SEC's "recent" block is read: the latest 1,000 filings or the last
+   * year, whichever is more. Older filings are not returned.
    *
    * Pages continue after the cursor's position rather than at an offset, so
    * filings that arrive between requests do not shift or repeat results.
@@ -90,12 +93,17 @@ function filterFilings(filings: Filing[], filters: FilingFilters): Filing[] {
   const formTypes = filters.formTypes?.map((type) => type.toUpperCase());
   const { startDate, endDate } = filters;
 
+  // Dates are ISO `YYYY-MM-DD`, so string comparison orders them correctly.
   return filings
     .filter(
       (filing) =>
         !formTypes?.length || formTypes.includes(filing.formType.toUpperCase()),
     )
-    .filter((filing) => isInDateRange(filing.reportDate, startDate, endDate))
+    .filter(
+      (filing) =>
+        (startDate === undefined || filing.filingDate >= startDate) &&
+        (endDate === undefined || filing.filingDate <= endDate),
+    )
     .sort(newestFirst);
 }
 
@@ -104,23 +112,6 @@ function newestFirst(a: FilingPosition, b: FilingPosition): number {
   return (
     b.filingDate.localeCompare(a.filingDate) ||
     b.accessionNumber.localeCompare(a.accessionNumber)
-  );
-}
-
-// Dates are ISO `YYYY-MM-DD`, so string comparison orders them correctly.
-// Filings without a report date never match a date range.
-function isInDateRange(
-  reportDate: string | null,
-  startDate?: string,
-  endDate?: string,
-): boolean {
-  if (startDate === undefined && endDate === undefined) {
-    return true;
-  }
-  return (
-    reportDate !== null &&
-    (startDate === undefined || reportDate >= startDate) &&
-    (endDate === undefined || reportDate <= endDate)
   );
 }
 

@@ -23,7 +23,68 @@
 
 ## Description
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+An API for looking up companies and their SEC filings, backed by [SEC EDGAR](https://www.sec.gov/edgar). Built with [Nest](https://github.com/nestjs/nest).
+
+## API
+
+Every response, successful or not, uses the same envelope. `status` mirrors the HTTP status code:
+
+```json
+{ "data": { ... }, "error": null, "status": 200 }
+{ "data": null, "error": { "message": "...", "status": 404 }, "status": 404 }
+```
+
+Errors from SEC are forwarded with SEC's status code and message.
+
+### `GET /api/companies/{ticker}`
+
+Looks up a company. The ticker is case-insensitive.
+
+```json
+{ "cik": 320193, "ticker": "AAPL", "name": "Apple Inc." }
+```
+
+### `GET /api/companies/{ticker}/filings`
+
+Lists the company's filings, newest first by filing date.
+
+| Query parameter | Description |
+| --- | --- |
+| `form-type` | Form types to include, comma-separated or repeated (`10-K,8-K`). Matching is exact and case-insensitive: amendments such as `10-K/A` are only included when requested explicitly. |
+| `start-date`, `end-date` | Inclusive `YYYY-MM-DD` range on the **filing date**. |
+| `limit` | Page size, 1 to 200. Defaults to 50. |
+| `cursor` | The `nextCursor` from the previous page. It must be used with the same filters as the first page, otherwise the request fails with 400. |
+
+```json
+{
+  "items": [
+    {
+      "accessionNumber": "0000320193-25-000079",
+      "formType": "10-K",
+      "filingDate": "2025-10-31",
+      "reportDate": "2025-09-27",
+      "primaryDocumentUrl": "https://www.sec.gov/Archives/edgar/data/320193/000032019325000079/aapl-20250927.htm"
+    }
+  ],
+  "pagination": { "limit": 50, "total": 1, "nextCursor": null, "next": null }
+}
+```
+
+`total` counts all matching filings. To read every page, follow `next` (a relative URL) until it is `null`.
+
+`reportDate` is the end of the period the filing covers. It is `null` for filings without one, such as many prospectuses.
+
+> **Date filter changed:** `start-date` and `end-date` used to filter on the report date and left out filings without one. They now filter on the filing date, the same date the list is sorted by, so every filing can match a date range.
+
+### `GET /api/companies/{ticker}/filings/{accessionNumber}`
+
+Fetches one filing of the company. The accession number may be written with or without dashes (`0000320193-25-000079` or `000032019325000079`). The response is a single filing, shaped like an item above.
+
+### Limitations
+
+- **Only recent filings are available.** The API reads SEC's "recent" filings, which hold a company's latest 1,000 filings or its last year of filings, whichever is more. For most companies that reaches back several years (Apple: to 2015), but for very frequent filers it can be about a year (JPMorgan: to late 2025). Older filings are not listed and cannot be fetched by accession number.
+- SEC data is cached in memory: the ticker list for 24 hours and each company's filings for 10 minutes, so new filings can take up to 10 minutes to appear.
+- Requests to SEC are limited to 7 per second per running instance.
 
 ## Project setup
 
