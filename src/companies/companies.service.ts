@@ -1,5 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { EdgarService } from '../edgar/edgar.service.js';
+import { CachedEdgarService } from '../edgar/cached-edgar.service.js';
 import { EdgarRecentFilings } from '../edgar/edgar.types.js';
 import { Company } from './company.js';
 import { Filing, FilingFilters } from './filing.js';
@@ -11,7 +11,7 @@ const ARCHIVES_BASE_URL = 'https://www.sec.gov/Archives/edgar/data';
 export class CompaniesService {
   constructor(
     private readonly tickerCikService: TickerCikService,
-    private readonly edgarService: EdgarService,
+    private readonly edgarService: CachedEdgarService,
   ) {}
 
   getCompany(ticker: string): Promise<Company> {

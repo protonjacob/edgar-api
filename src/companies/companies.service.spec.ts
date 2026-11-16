@@ -1,5 +1,5 @@
 import { NotFoundException } from '@nestjs/common';
-import type { EdgarService } from '../edgar/edgar.service.js';
+import type { CachedEdgarService } from '../edgar/cached-edgar.service.js';
 import type { EdgarRecentFilings } from '../edgar/edgar.types.js';
 import { CompaniesService } from './companies.service.js';
 import type { TickerCikService } from './ticker-cik.service.js';
@@ -48,7 +48,7 @@ describe('CompaniesService', () => {
     });
     service = new CompaniesService(
       { resolve } as unknown as TickerCikService,
-      { getSubmissions } as unknown as EdgarService,
+      { getSubmissions } as unknown as CachedEdgarService,
     );
   });
 

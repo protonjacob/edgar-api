@@ -1,5 +1,5 @@
 import { NotFoundException } from '@nestjs/common';
-import type { EdgarService } from '../edgar/edgar.service.js';
+import type { CachedEdgarService } from '../edgar/cached-edgar.service.js';
 import { TickerCikService } from './ticker-cik.service.js';
 
 describe('TickerCikService', () => {
@@ -13,11 +13,7 @@ describe('TickerCikService', () => {
     });
     service = new TickerCikService({
       getCompanyTickers,
-    } as unknown as EdgarService);
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
+    } as unknown as CachedEdgarService);
   });
 
   it('resolves a ticker regardless of case', async () => {
@@ -34,37 +30,5 @@ describe('TickerCikService', () => {
     await expect(service.resolve('NOPE')).rejects.toThrow(
       new NotFoundException("Company with ticker 'NOPE' not found"),
     );
-  });
-
-  it('caches the ticker list between calls', async () => {
-    await service.resolve('AAPL');
-    await service.resolve('BRK-B');
-
-    expect(getCompanyTickers).toHaveBeenCalledTimes(1);
-  });
-
-  it('shares one load between concurrent calls', async () => {
-    await Promise.all([service.resolve('AAPL'), service.resolve('aapl')]);
-
-    expect(getCompanyTickers).toHaveBeenCalledTimes(1);
-  });
-
-  it('reloads the ticker list after 24 hours', async () => {
-    vi.useFakeTimers();
-    await service.resolve('AAPL');
-
-    vi.advanceTimersByTime(24 * 60 * 60 * 1000);
-    await service.resolve('AAPL');
-
-    expect(getCompanyTickers).toHaveBeenCalledTimes(2);
-  });
-
-  it('retries the load after a failure', async () => {
-    getCompanyTickers.mockRejectedValueOnce(new Error('boom'));
-
-    await expect(service.resolve('AAPL')).rejects.toThrow('boom');
-    await expect(service.resolve('AAPL')).resolves.toMatchObject({
-      cik: 320193,
-    });
   });
 });
