@@ -1,29 +1,56 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
-
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
-
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
-
-## Description
+# edgar-api
 
 An API for looking up companies and their SEC filings, backed by [SEC EDGAR](https://www.sec.gov/edgar). Built with [Nest](https://github.com/nestjs/nest).
+
+## Getting started
+
+Requires Node.js 20 or later (the minimum for Nest 12).
+
+```bash
+# install dependencies
+$ npm install
+
+# run in watch mode for development
+$ npm run start:dev
+
+# or build and run for production
+$ npm run build
+$ npm run start:prod
+```
+
+The API listens on port 3000 by default; set `PORT` to change it. No API keys or configuration are needed: data comes from SEC's public EDGAR endpoints.
+
+### Run the tests
+
+```bash
+# unit tests
+$ npm run test
+
+# e2e tests (SEC is faked, no network access needed)
+$ npm run test:e2e
+
+# test coverage
+$ npm run test:cov
+```
+
+### Example requests
+
+```bash
+# look up a company by ticker (case-insensitive)
+$ curl http://localhost:3000/api/companies/aapl
+
+# list a company's filings, newest first
+$ curl "http://localhost:3000/api/companies/aapl/filings"
+
+# only 10-K and 8-K filings filed during 2024, 10 per page
+$ curl "http://localhost:3000/api/companies/aapl/filings?form-type=10-K,8-K&start-date=2024-01-01&end-date=2024-12-31&limit=10"
+
+# fetch the next page by following pagination.next from the previous response
+$ curl "http://localhost:3000/api/companies/aapl/filings?form-type=10-K,8-K&start-date=2024-01-01&end-date=2024-12-31&limit=10&cursor=<nextCursor>"
+
+# fetch a single filing by accession number (with or without dashes)
+$ curl http://localhost:3000/api/companies/aapl/filings/0000320193-25-000079
+```
 
 ## API
 
@@ -86,37 +113,14 @@ Fetches one filing of the company. The accession number may be written with or w
 - SEC data is cached in memory: the ticker list for 24 hours and each company's filings for 10 minutes, so new filings can take up to 10 minutes to appear.
 - Requests to SEC are limited to 7 per second per running instance.
 
-## Project setup
+## Future work
 
-```bash
-$ npm install
-```
+These were deliberately left out of the current version and are planned for later:
 
-## Compile and run the project
-
-```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
-```
-
-## Run tests
-
-```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
-```
+- **Older filings.** Only SEC's "recent" filings are read (see Limitations). SEC lists older filings in additional files that are not fetched yet.
+- **Cache invalidation.** Cached SEC data only expires by time; there is no way to evict a company's filings early, for example when a new filing is known to exist.
+- **Cache memory limit.** Cached entries are not capped; a limit (for example least-recently-used eviction) is needed before serving many distinct companies.
+- **Hardening from code review.** Known smaller items: a timeout on SEC requests, tying a pagination cursor to its company, checking the shape of SEC responses, logging upstream errors, and clearer validation messages.
 
 ## Deployment
 
