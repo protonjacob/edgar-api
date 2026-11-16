@@ -1,0 +1,19 @@
+Incredibly short notes on what I've built, skipped and what I'd like to do next:
+
+Built: API wrapper-ish to access the SEC EDGAR API in the specified way.
+
+Consists of a couple of layers / services (not necessarily in this order):
+1. Endpoints layer
+2. Cache layer
+3. Rate limiter layer
+4. Edgar access layer
+5. Ticker symbol -> CIK service
+6. CIK padding service
+
+Skipped: Cache invalidation - Not sure when cache should be invalidated, would need to research more.
+Skipped: Memory limit - didn't feel applicable here. :)
+
+Future: Redis cache or similar - better for the real life scenario in my opinion.
+Future: More endpoints for different types of data
+Future: Infrastructure for real deployment
+Future: Auth and customer rate limiting probably
